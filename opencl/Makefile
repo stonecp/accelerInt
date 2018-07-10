@@ -165,15 +165,19 @@ all: exec
 	${FC} ${FFLAGS} -c $<
 %.o: %.c
 	${CC} ${CFLAGS} -c $<
+	$(CC) $(CFLAGS) -MM $< > $*.d
 %.o: %.cxx
 	${CXX} ${CXXFLAGS} -c $<
+	$(CXX) $(CXXFLAGS) -MM $< > $*.d
+
+-include *.d
 
 $(EXEC) : test_ck.cxx ${OBJS}
 #%.exe : test_ck.cxx ${OBJS}
 	@echo "Building executable $@"
 	${CXX} ${CXXFLAGS} -o $@ $< ${OBJS} ${LDFLAGS}
 
-driver : driver.cxx ${OBJS}
+driver : driver.o ${OBJS}
 	@echo "Building executable $@"
 	${CXX} ${CXXFLAGS} -o $@ $< ${OBJS} ${LDFLAGS}
 
@@ -184,7 +188,7 @@ objs:
 
 clean:
 	@echo "Cleaning objects ..."
-	@/bin/rm -fv ${OBJS} *.o __kernel_source.cl
+	@/bin/rm -fv ${OBJS} *.o __kernel_source.cl *.d
 
 veryclean: clean
 	@echo "Cleaning executables ..."

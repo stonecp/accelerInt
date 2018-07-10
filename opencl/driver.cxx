@@ -43,6 +43,11 @@
 #define getTempIndex(neq) ( (neq)-1 )
 #define getFirstSpeciesIndex(neq) ( 0 )
 
+#define ENABLE_SIMD
+#ifdef ENABLE_SIMD
+# include "simd_cklib.hpp"
+#endif
+
 void ckrhs (const double p,
             const double T,
             const double y[],
@@ -102,6 +107,8 @@ struct cklib_functor
    ~cklib_functor()
    {
    }
+
+   double getPressure(void) const { return this->m_pres; }
 
    void operator() (const int &neq, double y[], double f[])
    {
@@ -472,6 +479,12 @@ int main (int argc, char* argv[])
    VectorType<double> u(neq);
 
    cklib_functor cklib_func( ckptr, p );
+
+#ifdef ENABLE_SIMD
+   {
+      SIMD::test_simd_rhs( numProblems, &u_in[0], cklib_func, ckptr );
+   }
+#endif
 
 #ifdef USE_SUNDIALS
    CV::Integrator< cklib_functor > cv_obj( neq );
