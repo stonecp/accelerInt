@@ -390,6 +390,12 @@ int main (int argc, char* argv[])
       }
 
       np = atoi( file_data[0][0].c_str() );
+      if ( np > file_data.size()-1 )
+      {
+         fprintf(stderr,"Input profile file error: fewer lines than specified %d %d\n", np, file_data.size()-1);
+         return -1;
+      }
+
       int nsp = atoi( file_data[0][1].c_str() );
       if (nsp != ck.n_species)
       {
