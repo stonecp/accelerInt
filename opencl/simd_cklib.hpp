@@ -13,21 +13,45 @@
   #define RESTRICT __restrict__
 #endif
 
-// Normal object header.
+// Local header(s).
 #include "cklib.h"
+#include "clock.h"
 
 namespace SIMD
 {
 
+const int Alignment = 64;
+
 // Master VCL header
 #ifndef  MAX_VECTOR_SIZE
-# define MAX_VECTOR_SIZE (256)
+# define MAX_VECTOR_SIZE (512)
 #endif
 #define VCL_NAMESPACE VCL
 #include "vcl/vectorclass.h"
 #include "vcl/vectormath_exp.h"
 
 using namespace VCL;
+
+template <typename T, int VL>
+struct VCL_TypeSelector;
+
+template<> struct VCL_TypeSelector<double,2> { typedef VCL::Vec2d value_type; };
+template<> struct VCL_TypeSelector<double,4> { typedef VCL::Vec4d value_type; };
+template<> struct VCL_TypeSelector<double,8> { typedef VCL::Vec8d value_type; };
+
+template <typename V>
+struct VCL_MaskSelector;
+
+template<> struct VCL_MaskSelector<VCL::Vec2d> { typedef VCL::Vec2db mask_type; };
+template<> struct VCL_MaskSelector<VCL::Vec4d> { typedef VCL::Vec4db mask_type; };
+template<> struct VCL_MaskSelector<VCL::Vec8d> { typedef VCL::Vec8db mask_type; };
+
+template <typename V>
+struct VCL_Length;
+
+template<> struct VCL_Length<VCL::Vec2d> { enum { length = 2 }; };
+template<> struct VCL_Length<VCL::Vec4d> { enum { length = 4 }; };
+template<> struct VCL_Length<VCL::Vec8d> { enum { length = 8 }; };
 
 // Internal utility functions ...
 
@@ -543,76 +567,149 @@ void ckrhs (const ValueType& p,
    return;
 }
 
+template <typename SimdType>
+struct simd_cklib_functor
+{
+   const ckdata_t *m_ckptr;
+   const SimdType m_pres;
+   VectorType<SimdType,Alignment> m_rwk;
+
+   simd_cklib_functor( const ckdata_t *ckptr, const double p = __PA__ )
+      : m_ckptr(ckptr), m_pres(p)
+      {
+         this->m_rwk.resize( VCL_Length<SimdType>::length * ck_lenrwk(m_ckptr) );
+      }
+
+   SimdType getPressure(void) const { return m_pres; }
+
+   int rhs (const int &neq, const SimdType time, SimdType y[], SimdType f[])
+   {
+      const int kk = this->m_ckptr->n_species;
+
+      const SimdType T = y[ getTempIndex(neq) ];
+      const SimdType *yk = y + getFirstSpeciesIndex(neq);
+
+      SimdType *ykdot = f + getFirstSpeciesIndex(neq);
+      SimdType *Tdot = f + getTempIndex(neq);
+
+      const SimdType &p = this->m_pres;
+
+      ckrhs ( p, T, *Tdot, yk, ykdot, this->m_ckptr, this->m_rwk.getPointer() );
+
+      return 0;
+   }
+
+   int jac (const int &neq, double t, double y[], double fy[]);
+};
+
+
 template <typename Func>
 void test_simd_rhs ( const int numProblems, const double *u_in, Func& func, const ckdata_t *RESTRICT ck )
 {
    const int kk = ck->n_species;
    const int neq = kk+1;
 
-   typedef VCL::Vec4d SimdType;
-   const int VectorLength = sizeof(SimdType) / sizeof(double);
-   
-   printf("Instruction Set= %d %s %d\n", INSTRSET, typeid(SimdType).name(), VectorLength);
+   typedef typename VCL_TypeSelector<double,4>::value_type SimdType;
+   typedef typename VCL_MaskSelector<SimdType>::mask_type MaskType;
+   //const int VectorLength = sizeof(SimdType) / sizeof(double);
+   const int VectorLength = VCL_Length<SimdType>::length;
+
+   printf("Instruction Set= %d %s %d %s\n", INSTRSET, typeid(SimdType).name(), VectorLength, typeid( MaskType).name());
 
    const double p = func.getPressure();
 
-   VectorType<double,64> scalar_out( neq * numProblems );
-   VectorType<double,64> vector_out( neq * numProblems );
+   VectorType<double,Alignment> scalar_out( neq * numProblems );
+   VectorType<double,Alignment> vector_out( neq * numProblems );
 
-   SimdType v_p(p);
+   alignas(Alignment) double T0[VectorLength];
+   alignas(Alignment) double Tdot[VectorLength];
+   VectorType<double,Alignment> y0(VectorLength*kk);
+   VectorType<double,Alignment> ykdot(VectorLength*kk);
+   VectorType<SimdType,Alignment> v_rwk( ck_lenrwk(ck) );
 
-   alignas(64) double T0[VectorLength];
-   alignas(64) double Tdot[VectorLength];
-   VectorType<double,64> y0(VectorLength*kk);
-   VectorType<double,64> ykdot(VectorLength*kk);
-   VectorType<SimdType,64> v_rwk( ck_lenrwk(ck) );
+   VectorType<double,Alignment> _u(VectorLength*neq);
+   VectorType<double,Alignment> _f(VectorLength*neq);
+
+   simd_cklib_functor<SimdType> simd_func( ck );
 
    double sum_v = 0, sum_s = 0;
 
-   for (int iter = 0; iter < 1; ++iter)
-   {
+   double time_scalar = 0, time_vector = 0;
 
-   for (int i = 0; i < numProblems; ++i)
-      func.rhs( neq, 0.0, const_cast<double*>(&u_in[neq*i]), &scalar_out[neq*i] );
-
-   for (int i0 = 0; i0 < numProblems; i0 += VectorLength)
-   {
-      if ( i0 + VectorLength < numProblems )
+   for (int iter = 0; iter < 20; ++iter)
+      if (iter % 2 == 0)
       {
-         for (int i = 0; i < VectorLength; ++i)
-         {
-            const double *ui = u_in + neq*(i0+i);
-            T0[i] = ui[ getTempIndex(neq) ];
-            for (int k = 0; k < kk; ++k)
-               y0[k*VectorLength+i] = ui[ getFirstSpeciesIndex(neq)+k ];
-         }
+         double time_start = WallClock();
 
-         SimdType *v_T = (SimdType *) &T0;
-         SimdType *v_Tdot = (SimdType *) &Tdot;
-         SimdType *v_y0 = (SimdType *) y0.getPointer();
-         SimdType *v_ykdot = (SimdType *) ykdot.getPointer();
+         for (int i = 0; i < numProblems; ++i)
+            func.rhs( neq, 0.0, const_cast<double*>(&u_in[neq*i]), &scalar_out[neq*i] );
 
-         SIMD::ckrhs( v_p, *v_T, *v_Tdot, v_y0, v_ykdot, ck, v_rwk.getPointer() );
-
-         for (int i = 0; i < VectorLength; ++i)
-         {
-            double *v_out = vector_out.getPointer() + neq*(i0+i);
-            v_out[ getTempIndex(neq) ] = Tdot[i];
-            for (int k = 0; k < kk; ++k)
-               v_out[ getFirstSpeciesIndex(neq)+k ] = v_ykdot[k].extract(i);
-         }
+         sum_s += scalar_out[iter/2];
+         time_scalar += (WallClock() - time_start);
       }
       else
       {
-         for (int i = i0; i < numProblems; ++i)
-            func.rhs( neq, 0.0, const_cast<double*>(&u_in[neq*i]), &vector_out[neq*i] );
+         double time_start = WallClock();
+         for (int i0 = 0; i0 < numProblems; i0 += VectorLength)
+         {
+            if ( i0 + VectorLength < numProblems )
+            {
+               //for (int i = 0; i < VectorLength; ++i)
+               //{
+               //   const double *ui = u_in + neq*(i0+i);
+               //   T0[i] = ui[ getTempIndex(neq) ];
+               //   for (int k = 0; k < kk; ++k)
+               //      y0[k*VectorLength+i] = ui[ getFirstSpeciesIndex(neq)+k ];
+               //}
+
+               //SimdType v_p(p);
+
+               //SimdType *v_T     = (SimdType *) &T0;
+               //SimdType *v_Tdot  = (SimdType *) &Tdot;
+               //SimdType *v_y0    = (SimdType *) y0.getPointer();
+               //SimdType *v_ykdot = (SimdType *) ykdot.getPointer();
+
+               //SIMD::ckrhs( v_p, *v_T, *v_Tdot, v_y0, v_ykdot, ck, v_rwk.getPointer() );
+
+               //for (int i = 0; i < VectorLength; ++i)
+               //{
+               //   double *v_out = vector_out.getPointer() + neq*(i0+i);
+               //   v_out[ getTempIndex(neq) ] = Tdot[i];
+               //   for (int k = 0; k < kk; ++k)
+               //      v_out[ getFirstSpeciesIndex(neq)+k ] = v_ykdot[k].extract(i);
+               //}
+
+               for (int i = 0; i < VectorLength; ++i)
+               {
+                  const double *ui = u_in + neq*(i0+i);
+                  for (int j = 0; j < neq; ++j)
+                     _u[j*VectorLength+i] = ui[j];
+               }
+
+               SimdType *v_u = (SimdType *) _u.getPointer();
+               SimdType *v_f = (SimdType *) _f.getPointer();
+
+               simd_func.rhs ( neq, SimdType(0), v_u, v_f );
+
+               for (int i = 0; i < VectorLength; ++i)
+               {
+                  double *v_out = vector_out.getPointer() + neq*(i0+i);
+                  for (int j = 0; j < neq; ++j)
+                     v_out[j] = _f[j*VectorLength+i];
+               }
+            }
+            else
+            {
+               for (int i = i0; i < numProblems; ++i)
+                  func.rhs( neq, 0.0, const_cast<double*>(&u_in[neq*i]), &vector_out[neq*i] );
+            }
+         }
+
+         sum_v += vector_out[iter/2];
+         time_vector += (WallClock() - time_start);
       }
-   }
 
-   sum_v += vector_out[iter];
-   sum_s += scalar_out[iter];
-
-   }
+   printf("SIMD timer: %f %f %.1f %d %e\n", 1000.*time_vector, 1000.*time_scalar, time_scalar/time_vector, sum_s == sum_v, fabs(sum_s-sum_v)/fabs(sum_s));
 
    {
       double err2, ref2 = 0;
@@ -628,18 +725,18 @@ void test_simd_rhs ( const int numProblems, const double *u_in, Func& func, cons
 
       printf("err2= %e %e %e %d\n", err2, ref2, std::sqrt(err2)/std::sqrt(ref2), numProblems % VectorLength);
    }
-   for (int k = 0; k < kk; ++k)
    {
       double err2, ref2 = 0;
-      for (int i = 0; i < numProblems; ++i)
-      {
-         const double *v_out = vector_out.getPointer() + neq*i;
-         const double *s_out = scalar_out.getPointer() + neq*i;
-         double diff = s_out[ getFirstSpeciesIndex(neq)+k ]
-                     - v_out[ getFirstSpeciesIndex(neq)+k ];
-         err2 += sqr( diff );
-         ref2 += sqr( s_out[ getFirstSpeciesIndex(neq)+k ] );
-      }
+      for (int k = 0; k < kk; ++k)
+         for (int i = 0; i < numProblems; ++i)
+         {
+            const double *v_out = vector_out.getPointer() + neq*i;
+            const double *s_out = scalar_out.getPointer() + neq*i;
+            double diff = s_out[ getFirstSpeciesIndex(neq)+k ]
+                        - v_out[ getFirstSpeciesIndex(neq)+k ];
+            err2 += sqr( diff );
+            ref2 += sqr( s_out[ getFirstSpeciesIndex(neq)+k ] );
+         }
 
       printf("err2= %e %e %e\n", err2, ref2, std::sqrt(err2)/std::sqrt(ref2));
    }
