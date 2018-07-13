@@ -38,6 +38,9 @@ struct VCL_TypeSelector;
 template<> struct VCL_TypeSelector<double,2> { typedef VCL::Vec2d value_type; };
 template<> struct VCL_TypeSelector<double,4> { typedef VCL::Vec4d value_type; };
 template<> struct VCL_TypeSelector<double,8> { typedef VCL::Vec8d value_type; };
+template<> struct VCL_TypeSelector<int64_t,2> { typedef VCL::Vec2q value_type; };
+template<> struct VCL_TypeSelector<int64_t,4> { typedef VCL::Vec4q value_type; };
+template<> struct VCL_TypeSelector<int64_t,8> { typedef VCL::Vec8q value_type; };
 
 template <typename V>
 struct VCL_MaskSelector;
@@ -45,6 +48,9 @@ struct VCL_MaskSelector;
 template<> struct VCL_MaskSelector<VCL::Vec2d> { typedef VCL::Vec2db mask_type; };
 template<> struct VCL_MaskSelector<VCL::Vec4d> { typedef VCL::Vec4db mask_type; };
 template<> struct VCL_MaskSelector<VCL::Vec8d> { typedef VCL::Vec8db mask_type; };
+template<> struct VCL_MaskSelector<VCL::Vec2q> { typedef VCL::Vec2qb mask_type; };
+template<> struct VCL_MaskSelector<VCL::Vec4q> { typedef VCL::Vec4qb mask_type; };
+template<> struct VCL_MaskSelector<VCL::Vec8q> { typedef VCL::Vec8qb mask_type; };
 
 template <typename V>
 struct VCL_Length;
@@ -52,6 +58,33 @@ struct VCL_Length;
 template<> struct VCL_Length<VCL::Vec2d> { enum { length = 2 }; };
 template<> struct VCL_Length<VCL::Vec4d> { enum { length = 4 }; };
 template<> struct VCL_Length<VCL::Vec8d> { enum { length = 8 }; };
+
+template <typename MaskType>
+inline bool all( const MaskType& mask )
+{
+   return horizontal_and( mask );
+}
+
+template <typename MaskType>
+inline bool any( const MaskType& mask )
+{
+   return horizontal_or( mask );
+}
+
+template <typename SimdType>
+std::string toString (const SimdType& x)
+{
+   const int len = SimdType::size();
+   std::ostringstream oss;
+   oss << "[";
+   for (int i = 0; i < len; ++i) {
+      oss << x[i];
+      if (i != len-1) oss << ",";
+   }
+   oss << "]";
+   
+   return std::string( oss.str() );
+}
 
 // Internal utility functions ...
 
@@ -582,7 +615,12 @@ struct simd_cklib_functor
 
    SimdType getPressure(void) const { return m_pres; }
 
-   int rhs (const int &neq, const SimdType time, SimdType y[], SimdType f[])
+   int operator() (const int &neq, const SimdType& time, SimdType y[], SimdType f[])
+   {
+      return this->rhs( neq, time, y, f );
+   }
+
+   int rhs (const int &neq, const SimdType& time, SimdType y[], SimdType f[])
    {
       const int kk = this->m_ckptr->n_species;
 
@@ -654,31 +692,6 @@ void test_simd_rhs ( const int numProblems, const double *u_in, Func& func, cons
          {
             if ( i0 + VectorLength < numProblems )
             {
-               //for (int i = 0; i < VectorLength; ++i)
-               //{
-               //   const double *ui = u_in + neq*(i0+i);
-               //   T0[i] = ui[ getTempIndex(neq) ];
-               //   for (int k = 0; k < kk; ++k)
-               //      y0[k*VectorLength+i] = ui[ getFirstSpeciesIndex(neq)+k ];
-               //}
-
-               //SimdType v_p(p);
-
-               //SimdType *v_T     = (SimdType *) &T0;
-               //SimdType *v_Tdot  = (SimdType *) &Tdot;
-               //SimdType *v_y0    = (SimdType *) y0.getPointer();
-               //SimdType *v_ykdot = (SimdType *) ykdot.getPointer();
-
-               //SIMD::ckrhs( v_p, *v_T, *v_Tdot, v_y0, v_ykdot, ck, v_rwk.getPointer() );
-
-               //for (int i = 0; i < VectorLength; ++i)
-               //{
-               //   double *v_out = vector_out.getPointer() + neq*(i0+i);
-               //   v_out[ getTempIndex(neq) ] = Tdot[i];
-               //   for (int k = 0; k < kk; ++k)
-               //      v_out[ getFirstSpeciesIndex(neq)+k ] = v_ykdot[k].extract(i);
-               //}
-
                for (int i = 0; i < VectorLength; ++i)
                {
                   const double *ui = u_in + neq*(i0+i);
@@ -710,6 +723,559 @@ void test_simd_rhs ( const int numProblems, const double *u_in, Func& func, cons
       }
 
    printf("SIMD timer: %f %f %.1f %d %e\n", 1000.*time_vector, 1000.*time_scalar, time_scalar/time_vector, sum_s == sum_v, fabs(sum_s-sum_v)/fabs(sum_s));
+
+   {
+      double err2, ref2 = 0;
+      for (int i = 0; i < numProblems; ++i)
+      {
+         const double *v_out = vector_out.getPointer() + neq*i;
+         const double *s_out = scalar_out.getPointer() + neq*i;
+         double diff = s_out[ getTempIndex(neq) ]
+                     - v_out[ getTempIndex(neq) ];
+         err2 += sqr( diff );
+         ref2 += sqr( s_out[ getTempIndex(neq) ] );
+      }
+
+      printf("err2= %e %e %e %d\n", err2, ref2, std::sqrt(err2)/std::sqrt(ref2), numProblems % VectorLength);
+   }
+   {
+      double err2, ref2 = 0;
+      for (int k = 0; k < kk; ++k)
+         for (int i = 0; i < numProblems; ++i)
+         {
+            const double *v_out = vector_out.getPointer() + neq*i;
+            const double *s_out = scalar_out.getPointer() + neq*i;
+            double diff = s_out[ getFirstSpeciesIndex(neq)+k ]
+                        - v_out[ getFirstSpeciesIndex(neq)+k ];
+            err2 += sqr( diff );
+            ref2 += sqr( s_out[ getFirstSpeciesIndex(neq)+k ] );
+         }
+
+      printf("err2= %e %e %e\n", err2, ref2, std::sqrt(err2)/std::sqrt(ref2));
+   }
+
+   return;
+}
+
+template <typename ValueType>
+struct simd_rk_solver_type : public rk_t
+{
+   enum { vlen = VCL_Length<ValueType>::length };
+
+   typedef typename VCL_MaskSelector< ValueType >::mask_type MaskType;
+
+   struct Counters
+   {
+      int nit;
+      typename VCL_TypeSelector<int64_t,vlen>::value_type nst;
+      typename VCL_TypeSelector<int64_t,vlen>::value_type errflag;
+   };
+
+   VectorType<ValueType,Alignment> m_rwk;
+
+   simd_rk_solver_type(const int _neq)
+      : rk_t()
+   {
+      rk_create( (rk_t *) this, _neq );
+      m_rwk.resize( rk_lenrwk( (rk_t *) this ) );
+   }
+
+   template <class Functor>
+   int oneStep (const ValueType& h,
+                      ValueType *RESTRICT y,
+                      ValueType *RESTRICT y_out,
+                      ValueType *RESTRICT rwk,
+                      Functor&   func)
+   {
+      static
+      const double c20 = 0.25,
+                   c21 = 0.25,
+                   c30 = 0.375,
+                   c31 = 0.09375,
+                   c32 = 0.28125,
+                   c40 = 0.92307692307692,
+                   c41 = 0.87938097405553,
+                   c42 =-3.2771961766045,
+                   c43 = 3.3208921256258,
+                   c51 = 2.0324074074074,
+                   c52 =-8.0,
+                   c53 = 7.1734892787524,
+                   c54 =-0.20589668615984,
+                   c60 = 0.5,
+                   c61 =-0.2962962962963,
+                   c62 = 2.0,
+                   c63 =-1.3816764132554,
+                   c64 = 0.45297270955166,
+                   c65 =-0.275,
+                   a1 = 0.11574074074074,
+                   a2 = 0.0,
+                   a3 = 0.54892787524366,
+                   a4 = 0.5353313840156,
+                   a5 =-0.2,
+                   b1 = 0.11851851851852,
+                   b2 = 0.0,
+                   b3 = 0.51898635477583,
+                   b4 = 0.50613149034201,
+                   b5 =-0.18,
+                   b6 = 0.036363636363636;
+
+      // local dependent variables (5 total)
+      ValueType *RESTRICT f1   = rwk ;
+      ValueType *RESTRICT f2   = rwk + (  neq) ;
+      ValueType *RESTRICT f3   = rwk + (2*neq) ;
+      ValueType *RESTRICT f4   = rwk + (3*neq) ;
+      ValueType *RESTRICT f5   = rwk + (4*neq) ;
+      ValueType *RESTRICT f6   = rwk + (5*neq) ;
+      ValueType *RESTRICT ytmp = rwk + (6*neq) ;
+
+      // 1)
+      func(neq, 0.0, y, f1);
+
+      for (int k = 0; k < neq; k++)
+      {
+         //f1[k] = h * ydot[k];
+         f1[k] *= h;
+         ytmp[k] = y[k] + c21 * f1[k];
+      }
+
+      // 2)
+      func(neq, 0.0, ytmp, f2);
+
+      for (int k = 0; k < neq; k++)
+      {
+         //f2[k] = h * ydot[k];
+         f2[k] *= h;
+         ytmp[k] = y[k] + c31 * f1[k] + c32 * f2[k];
+      }
+
+      // 3)
+      func(neq, 0.0, ytmp, f3);
+
+      for (int k = 0; k < neq; k++) {
+         //f3[k] = h * ydot[k];
+         f3[k] *= h;
+         ytmp[k] = y[k] + c41 * f1[k] + c42 * f2[k] + c43 * f3[k];
+      }
+
+      // 4)
+      func(neq, 0.0, ytmp, f4);
+
+      for (int k = 0; k < neq; k++) {
+         //f4[k] = h * ydot[k];
+         f4[k] *= h;
+         ytmp[k] = y[k] + c51 * f1[k] + c52 * f2[k] + c53 * f3[k] + c54 * f4[k];
+      }
+
+      // 5)
+      func(neq, 0.0, ytmp, f5);
+
+      for (int k = 0; k < neq; k++) {
+         //f5[k] = h * ydot[k];
+         f5[k] *= h;
+         ytmp[k] = y[k] + c61*f1[k] + c62*f2[k] + c63*f3[k] + c64*f4[k] + c65*f5[k];
+      }
+
+      // 6)
+      func(neq, 0.0, ytmp, f6);
+
+      for (int k = 0; k < neq; k++)
+      {
+         //const T f6 = h * ydot[k];
+         f6[k] *= h;
+
+         // 5th-order RK value.
+         const ValueType r5 = b1*f1[k] + b3*f3[k] + b4*f4[k] + b5*f5[k] + b6*f6[k];
+
+         // 4th-order RK residual.
+         const ValueType r4 = a1*f1[k] + a3*f3[k] + a4*f4[k] + a5*f5[k];
+
+         // Trucation error: difference between 4th and 5th-order RK values.
+         rwk[k] = abs(r5 - r4);
+
+         // Update solution.
+         y_out[k] = y[k] + r5; // Local extrapolation
+      }
+
+      return RK_SUCCESS;
+   }
+
+   ValueType wnorm (const ValueType *RESTRICT x, const ValueType *RESTRICT y)
+   {
+      const int neq = this->neq;
+      ValueType sum = 0;
+      for (int k = 0; k < neq; k++)
+      {
+         ValueType ewt = (this->s_rtol * abs(y[k])) + this->s_atol;
+         ValueType prod = x[k] / ewt;
+         sum += (prod*prod);
+      }
+
+      const double denom = 1.0 / neq;
+      return sqrt(sum * denom);
+   }
+
+   template <class Functor>
+   int hin ( const ValueType t, ValueType *h0, ValueType *RESTRICT y, ValueType *RESTRICT rwk, Functor& func)
+   {
+      //value_type tround = tdist * this->uround();
+      //double tdist = t_stop - t;
+      //double tround = tdist * rk_uround();
+
+      // Set lower and upper bounds on h0, and take geometric mean as first trial value.
+      // Exit with this value if the bounds cross each other.
+
+      //rk->h_min = fmax(tround * 100.0, rk->h_min);
+      //rk->h_max = fmin(tdist, rk->h_max);
+
+      const int neq = this->neq;
+
+      ValueType *RESTRICT ydot  = rwk;
+      ValueType *RESTRICT y1    = ydot + neq;
+      ValueType *RESTRICT ydot1 = y1 + neq;
+
+      int need_ydot = 1;
+
+      // Adjust upper bound based on ydot ...
+   /*    if (0)
+         {
+            need_ydot = false;
+
+            // compute ydot at t=t0
+            func (neq, y, ydot);
+            ++this->nfe;
+
+            for (int k = 0; k < neq; k++)
+            {
+               value_type dely = 0.1 * fabs(y[k]) + this->atol;
+               value_type hub0 = hub;
+               if (hub * fabs(ydot[k]) > dely) hub = dely / fabs(ydot[k]);
+               //printf("k=%d, hub0 = %e, hub = %e\n", k, hub0, hub);
+            }
+         }*/
+
+      double hlb = this->h_min;
+      double hub = this->h_max;
+
+      ValueType hg = std::sqrt(hlb*hub);
+
+      if (hub < hlb)
+      {
+         *h0 = hg;
+         return RK_SUCCESS;
+      }
+
+      // Start iteration to find solution to ... {WRMS norm of (h0^2 y'' / 2)} = 1
+
+      const int miters = 10;
+      MaskType hnew_is_ok( false );
+      ValueType hnew = hg;
+      int iter = 0;
+      int ierr = RK_SUCCESS;
+
+      // compute ydot at t=t0
+      if (need_ydot)
+      {
+         func(neq, 0.0, y, ydot);
+         //++rk->nfe;
+         need_ydot = 0;
+      }
+
+      while(1)
+      {
+         // Estimate y'' with finite-difference ...
+         //double t1 = hg;
+
+         #pragma ivdep
+         for (int k = 0; k < neq; k++)
+            y1[k] = y[k] + hg * ydot[k];
+
+         // compute y' at t1
+         func (neq, 0.0, y1, ydot1);
+         //++rk->nfe;
+
+         // Compute WRMS norm of y''
+         #pragma ivdep
+         for (int k = 0; k < neq; k++)
+            y1[k] = (ydot1[k] - ydot[k]) / hg;
+
+         ValueType yddnrm = this->wnorm ( y1, y );
+
+         //std::cout << "iter " << iter << " hg " << hg << " y'' " << yddnrm << std::endl;
+         //std::cout << "ydot " << ydot[neq-1] << std::endl;
+
+         // should we accept this?
+         hnew = select( hnew_is_ok | MaskType( iter == miters ), hg, hnew );
+         if ( all(hnew_is_ok) )
+         {
+            ierr = RK_SUCCESS;
+            break;
+         }
+         else if (iter == miters)
+         {
+            ierr = RK_HIN_MAX_ITERS;
+            break;
+         }
+
+         // Get the new value of h ...
+         {
+            auto mask = (yddnrm*hub*hub > ValueType(2.0));
+            hnew = select( mask, sqrt(2.0 / yddnrm), sqrt(hg * hub) );
+         }
+
+         // test the stopping conditions.
+         ValueType hrat = hnew / hg;
+
+         // Accept this value ... the bias factor should bring it within range.
+         hnew_is_ok = (hrat > 0.5) && (hrat < 2.0);
+
+         // If y'' is still bad after a few iterations, just accept h and give up.
+         if ( iter > 1 ) {
+            hnew_is_ok = (hrat > 2.0);
+            hnew = select( hnew_is_ok, hg, hnew );
+         }
+
+         //printf("iter=%d, yddnrw=%e, hnew=%e, hlb=%e, hub=%e\n", iter, yddnrm, hnew, hlb, hub);
+
+         hg = hnew;
+         iter ++;
+      }
+
+      // bound and bias estimate
+      *h0 = hnew * 0.5;
+      *h0 = max(*h0, hlb);
+      *h0 = min(*h0, hub);
+
+      //printf("h0=%e, hlb=%e, hub=%e\n", h0, hlb, hub);
+
+      return ierr;
+   }
+
+   int init (double t0, double t_stop)
+   {
+      rk_init( (rk_t *)this, t0, t_stop );
+   }
+
+   template <typename Functor, typename Counters>
+   int solve (ValueType* tcur, ValueType *hcur, Counters* counters, ValueType y[], Functor& func)
+   {
+      int ierr = RK_SUCCESS;
+
+      ValueType *rwk = m_rwk.getPointer();
+
+      // Estimate the initial step size ...
+      {
+         auto mask = (*hcur < this->h_min);
+         if ( any(mask) )
+         {
+            ValueType h0 = *hcur;
+            ierr = this->hin ( *tcur, &h0, y, rwk, func );
+            if (ierr != RK_SUCCESS)
+            {
+               printf("Failure in hin %d\n", ierr);
+               return ierr;
+            }
+
+            *hcur = select( mask, h0, *hcur );
+         }
+         printf("hin = %s %s %e %e\n", toString(*hcur).c_str(), toString(mask).c_str(), this->h_min, this->h_max);
+      }
+
+      #define t (*tcur)
+      #define h (*hcur)
+      #define iter (counters->nit)
+      #define nst (counters->nst)
+
+      nst = 0;
+      iter = 0;
+
+      MaskType not_done = abs(t - this->t_stop) > ValueType( this->t_round );
+
+      while (  any(not_done) )
+      {
+         ValueType *ytry = rwk + neq*7;
+
+         // Take a trial step over h_cur ...
+         this->oneStep ( h, y, ytry, rwk, func );
+
+         ValueType herr = max(1.0e-20, this->wnorm ( rwk, y ));
+
+         // Is there error acceptable?
+         MaskType accept = ((herr <= 1.0) | (h <= this->h_min)) & not_done;
+
+         // update solution ...
+         if ( any(accept) )
+         {
+            t   = select ( accept, t + h, t   );
+            nst = select ( accept, nst+1, nst );
+
+            for (int k = 0; k < neq; k++)
+               y[k] = select( accept, ytry[k], y[k] );
+
+            not_done = abs(t - this->t_stop) > this->t_round;
+         }
+
+         ValueType fact = sqrt( sqrt(1.0 / herr) ) * (0.840896415);
+
+         // Restrict the rate of change in dt
+         fact = max(fact, 1.0 / this->adaption_limit);
+         fact = min(fact,       this->adaption_limit);
+
+#if 1
+         if (iter % 10 == 0)
+            printf("iter = %d: accept=%s, not_done=%s t=%s, fact=%s %s %s\n", iter, toString(accept).c_str(), toString(not_done).c_str(), toString(t).c_str(), toString(fact).c_str(), toString(y[neq-1]).c_str(), toString(h).c_str());
+#endif
+
+         // Apply grow/shrink factor for next step.
+         h = select( not_done, h * fact, h);
+
+         // Limit based on the upper/lower bounds
+         h = fmin(h, this->h_max);
+         h = fmax(h, this->h_min);
+
+         // Stretch the final step if we're really close and we didn't just fail ...
+         h = select( accept & ( abs((t + h) - this->t_stop) < this->h_min), this->t_stop - t, h );
+
+         // Don't overshoot the final time ...
+         h = select( not_done & ((t + h) > this->t_stop), this->t_stop - t, h );
+
+         ++iter;
+         if ( this->max_iters && iter > this->max_iters )
+         {
+            ierr = RK_TOO_MUCH_WORK;
+            //printf("(iter > max_iters)\n");
+            break;
+         }
+      }
+
+      return ierr;
+
+      #undef t
+      #undef h
+      #undef iter
+      #undef nst
+   }
+};
+
+template <typename Functor, typename RHSptr>
+void simd_rk_driver ( const int numProblems, const double *u_in, const double t_stop, const Functor& func, const RHSptr rhs_func, const ckdata_t *RESTRICT ck )
+{
+   const int kk = ck->n_species;
+   const int neq = kk+1;
+   const double p = func.getPressure();
+
+   typedef typename VCL_TypeSelector<double,4>::value_type SimdType;
+   typedef typename VCL_MaskSelector<SimdType>::mask_type MaskType;
+   const int VectorLength = VCL_Length<SimdType>::length;
+
+   printf("Instruction Set= %d %s %d %s\n", INSTRSET, typeid(SimdType).name(), VectorLength, typeid( MaskType).name());
+
+   VectorType<double,Alignment> scalar_out( neq * numProblems );
+   VectorType<double,Alignment> vector_out( neq * numProblems );
+
+   rk_t rk;
+
+   rk_create (&rk, neq);
+
+   rk.max_iters = 1000;
+   rk.min_iters = 1;
+
+   int lenrwk = rk_lenrwk (&rk);
+   VectorType<double,Alignment> rwk( VectorLength * lenrwk );
+   VectorType<double,Alignment> u( VectorLength * neq );
+
+   int nst = 0, nit = 0, nfe = 0;
+
+   auto scalar_solver = [&](const int i, VectorType<double,Alignment>& out)
+   {
+      for (int k = 0; k < neq; ++k)
+         u[k] = u_in[ i*neq + k ];
+
+      const double T0 = u_in[ i*neq + getTempIndex(neq) ];
+
+      double t = 0, h = 0;
+      rk_counters_t counters;
+
+      rk_init (&rk, t, t_stop);
+
+      double t_begin = WallClock();
+
+      int ierr = rk_solve (&rk, &t, &h, &counters, u.getPointer(), rwk.getPointer(), rhs_func, (void*)&func);
+      if (ierr != RK_SUCCESS)
+      {
+         fprintf(stderr,"%d: rk_solve error %d %d %d\n", i, ierr, counters.niters, rk.max_iters);
+         exit(-1);
+      }
+
+      double t_end = WallClock();
+
+      const int _nst = counters.nsteps;
+      const int _nit = counters.niters;
+      const int _nfe = _nit * 6;
+
+      nst += _nst;
+      nit += _nit;
+      nfe += _nfe;
+
+      for (int k = 0; k < neq; ++k)
+         out[i*neq + k] = u[k];
+
+      if (i % 1 == 0)
+         printf("%d: %d %d %d %e %e %f\n", i, _nst, _nit, _nfe, u[ getTempIndex(neq) ], T0, 1000*(t_end-t_begin));
+   };
+
+   double time_scalar = WallClock();
+
+   for (int i = 0; i < numProblems; ++i)
+      scalar_solver(i, scalar_out);
+
+   rk_destroy(&rk);
+
+   time_scalar = WallClock() - time_scalar;
+
+   double time_vector = WallClock();
+
+   simd_cklib_functor<SimdType> simd_func( ck, p );
+   simd_rk_solver_type<SimdType> simd_solver( neq );
+   //simd_solver.max_iters=100;
+
+   for (int i0 = 0; i0 < numProblems; i0 += VectorLength)
+   {
+      if ( i0 + VectorLength <= numProblems )
+      {
+         for (int i = 0; i < VectorLength; ++i)
+         {
+            const double *ui = u_in + neq*(i0+i);
+            for (int j = 0; j < neq; ++j)
+               u[j*VectorLength+i] = ui[j];
+         }
+
+         SimdType *v_u = (SimdType *) u.getPointer();
+
+         SimdType t(0), h(0);
+         typename simd_rk_solver_type<SimdType>::Counters counters;
+
+         simd_solver.init( 0.0, t_stop );
+         simd_solver.solve ( &t, &h, &counters, v_u, simd_func );
+
+         for (int i = 0; i < VectorLength; ++i)
+         {
+            double *v_out = vector_out.getPointer() + neq*(i0+i);
+            for (int j = 0; j < neq; ++j)
+               v_out[j] = u[j*VectorLength+i];
+         }
+
+         printf("i0: %d %s %s\n", i0, toString(counters.nst).c_str(), toString( v_u[getTempIndex(neq)] ).c_str());
+      }
+      else
+      {
+         for (int i = i0; i < numProblems; ++i)
+            scalar_solver(i, vector_out );
+      }
+   }
+
+   time_vector = WallClock() - time_vector;
+
+   printf("SIMD timer: %f %f %.1f\n", 1000.*time_vector, 1000.*time_scalar, time_scalar/time_vector);
 
    {
       double err2, ref2 = 0;
