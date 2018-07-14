@@ -849,7 +849,8 @@ struct CommonSolverType
    enum { vector_length = VCL_Length<ValueType>::length,
           vlen = vector_length };
 
-   typedef typename VCL_TypeSelector<int64_t,vlen>::value_type IndexType;
+   typedef int64_t BaseIndexType;
+   typedef typename VCL_TypeSelector<BaseIndexType,vlen>::value_type IndexType;
 
    struct CountersType
    {
@@ -916,7 +917,7 @@ public:
       return ERR_SUCCESS;
    }
 
-   ValueType wnorm (const ValueType *RESTRICT x, const ValueType *RESTRICT y)
+   /*ValueType wnorm (const ValueType *RESTRICT x, const ValueType *RESTRICT y)
    {
       const int neq = this->neq;
       ValueType sum = 0;
@@ -929,10 +930,10 @@ public:
 
       const double denom = 1.0 / neq;
       return sqrt(sum * denom);
-   }
+   }*/
 
    template <class Functor>
-   int hin ( const ValueType t, ValueType *h0, ValueType *RESTRICT y, ValueType *RESTRICT rwk, Functor& func)
+   int hin ( const ValueType t, ValueType *h0, ValueType *RESTRICT y, ValueType *RESTRICT rwk, Functor& func) const
    {
       //value_type tround = tdist * this->uround();
       //double tdist = t_stop - t;
@@ -1070,6 +1071,255 @@ public:
 
       return ierr;
    }
+
+   ValueType getErrorWeight ( const int k, const ValueType *RESTRICT y ) const
+   {
+      //return (this->s_rtol * abs( y[k] )) + this->s_atol;
+      return 1.0/((this->s_rtol * abs( y[k] )) + this->s_atol);
+   }
+
+   ValueType wnorm (const ValueType *RESTRICT x, const ValueType *RESTRICT y) const
+   {
+      const int neq = this->neq;
+      ValueType sum(0);
+      for (int k = 0; k < neq; k++)
+      {
+         //ValueType prod = x[k] / this->getErrorWeight( k, y );
+         ValueType prod = x[k] * this->getErrorWeight( k, y );
+         sum += (prod*prod);
+      }
+
+      return sqrt(sum / (double)neq);
+   }
+   inline void dzero ( const int len, ValueType *RESTRICT x) const
+   {
+      const ValueType zero(0);
+      for (int k = 0; k < len; ++k)
+         x[k] = zero;
+   }
+
+   inline void dset ( const int len, ValueType *RESTRICT x, const double sval) const
+   {
+      const ValueType val(sval);
+      for (int k = 0; k < len; ++k)
+         x[k] = sval;
+   }
+
+   inline void dcopy ( const int len, const ValueType *RESTRICT src, ValueType *RESTRICT dst )
+   {
+      for (int k = 0; k < len; ++k)
+         dst[k] = src[k];
+   }
+   /*inline void dcopy_if (const int len, const MaskType &mask, const __global __ValueType src[], __global __ValueType dst[])
+   {
+      for (int k = 0; k < len; ++k)
+         dst[k] = if_then_else (mask, src[k], dst[k]);
+   }*/
+
+   inline void daxpy1 ( const int len, const double alpha, const ValueType *RESTRICT x, ValueType *RESTRICT y )
+   {
+      // Alpha is scalar type ... and can be easily checked.
+      if (alpha == 1.0)
+      {
+         for (int k = 0; k < len; ++k)
+            y[k] += x[k];
+      }
+      else if (alpha == -1.0)
+      {
+         for (int k = 0; k < len; ++k)
+            y[k] -= x[k];
+      }
+      else if (alpha != 0.0)
+      {
+         for (int k = 0; k < len; ++k)
+            y[k] += alpha * x[k];
+      }
+   }
+
+   inline void daxpy ( const int len, const ValueType& alpha, const ValueType *RESTRICT x, ValueType *RESTRICT y ) const
+   {
+      // Alpha is vector type ... tedious to switch.
+      for (int k = 0; k < len; ++k)
+         y[k] += alpha * x[k];
+   }
+
+   int ludec ( const int n, ValueType *RESTRICT A, IndexType *RESTRICT ipiv ) const
+   {
+      int ierr = ERR_SUCCESS;
+
+      const int nelems = this->vector_length;
+
+      //typedef typename decltype( ipiv[0][0] ) IndexBaseType;
+      //typedef int64_t BaseIndexType;
+      alignas(Alignment) BaseIndexType all_pivk[nelems];
+
+      /* k-th elimination step number */
+      for (int k = 0; k < n; ++k)
+      {
+        ValueType *A_k = A + (k*n); // pointer to this column
+
+        /* find pivot row number */
+        for (int el = 0; el < nelems; ++el)
+        {
+           int pivk = k;
+           double Akp = A_k[pivk].extract(el);
+           for (int i = k+1; i < n; ++i)
+           {
+              //const double Aki = __read_from( A_k[__getIndex(i)], el);
+              double Aki = A_k[i].extract(el);
+              if ( fabs(Aki) > fabs(Akp) )
+              {
+                 pivk = i;
+                 Akp = Aki;
+              }
+           }
+
+           // Test for singular value ...
+           if (Akp == 0.0)
+           {
+              ierr = (k+1);
+              //printf("Singular value %d %d\n", k, el);
+              break;
+           }
+
+           /* swap a(k,1:N) and a(piv,1:N) if necessary */
+           if ( pivk != k )
+           {
+              ValueType *A_i = A; // pointer to the first column
+              for (int i = 0; i < n; ++i, A_i += (n))
+              {
+                 const double Aik = A_i[k   ].extract(el);
+                 const double Aip = A_i[pivk].extract(el);
+                 A_i[k   ].insert( el, Aip );
+                 A_i[pivk].insert( el, Aik );
+              }
+           }
+
+           all_pivk[el] = pivk;
+
+        } // End scalar section
+
+        ipiv[k].load_a( all_pivk );
+
+        /* Scale the elements below the diagonal in
+         * column k by 1.0/a(k,k). After the above swap
+         * a(k,k) holds the pivot element. This scaling
+         * stores the pivot row multipliers a(i,k)/a(k,k)
+         * in a(i,k), i=k+1, ..., M-1.
+         */
+        const ValueType mult = 1.0 / A_k[k];
+        for (int i = k+1; i < n; ++i)
+          A_k[i] *= mult;
+
+        /* row_i = row_i - [a(i,k)/a(k,k)] row_k, i=k+1, ..., m-1 */
+        /* row k is the pivot row after swapping with row l.      */
+        /* The computation is done one column at a time,          */
+        /* column j=k+1, ..., n-1.                                */
+
+        for (int j = k+1; j < n; ++j)
+        {
+          ValueType *A_j = A + (j*n);
+          const ValueType a_kj = A_j[k];
+
+          /* a(i,j) = a(i,j) - [a(i,k)/a(k,k)]*a(k,j)  */
+          /* a_kj = a(k,j), col_k[i] = - a(i,k)/a(k,k) */
+          //if (any(a_kj != 0.0)) {
+            for (int i = k+1; i < n; ++i) {
+              A_j[i] -= a_kj * A_k[i];
+            }
+          //}
+        }
+      }
+
+      return ierr;
+      //if (ierr)
+      //{
+      //  fprintf(stderr,"Singular pivot j=%d\n", ierr-1);
+      //  exit(-1);
+      //}
+   }
+
+   void lusol ( const int n, ValueType *RESTRICT A, IndexType *RESTRICT ipiv, ValueType *RESTRICT b) const
+   {
+      /* Permute b, based on pivot information in p */
+      for (int k = 0; k < n; ++k)
+      {
+         if ( any( ipiv[k] != IndexType( k ) ) )
+         {
+            for (int el = 0; el < vlen; ++el)
+            {
+               const int pivk = ipiv[k].extract(el);
+               if ( pivk != k )
+               {
+                  const double bk = b[k   ].extract( el);
+                  const double bp = b[pivk].extract( el);
+                  b[k   ].insert( el, bp );
+                  b[pivk].insert( el, bk );
+               }
+            }
+         }
+      }
+
+      /* Solve Ly = b, store solution y in b */
+      for (int k = 0; k < n-1; ++k)
+      {
+         ValueType *A_k = A + (k*n);
+         const ValueType bk = b[k];
+         for (int i = k+1; i < n; ++i)
+            b[i] -= A_k[i] * bk;
+      }
+      /* Solve Ux = y, store solution x in b */
+      for (int k = n-1; k > 0; --k)
+      {
+         ValueType *A_k = A + (k*n);
+         b[k] /= A_k[k];
+         const ValueType bk = b[k];
+         for (int i = 0; i < k; ++i)
+            b[i] -= A_k[i] * bk;
+      }
+      b[0] /= A[0];
+   }
+
+   template <class Functor>
+   void fdjac ( const ValueType& tcur,
+                const ValueType& hcur,
+                      ValueType *RESTRICT y,
+                      ValueType *RESTRICT fy,
+                      ValueType *RESTRICT Jy,
+                      Functor& func ) const
+   {
+      const int neq = this->neq;
+
+      // Norm of fy(t) ...
+      const ValueType fnorm = this->wnorm( fy, y );
+
+      // Safety factors ...
+      const double sround = std::sqrt( this->uround() );
+      ValueType r0 = (1000. * this->uround() * neq) * (hcur * fnorm);
+      //if (r0 == 0.) r0 = 1.;
+      r0 = select( (r0 == 0.0), ValueType(1), r0 );
+
+      // Build each column vector ...
+      for (int j = 0; j < neq; ++j)
+      {
+         const ValueType ysav = y[j];
+         const ValueType ewtj = this->getErrorWeight( j, y);
+         //const ValueType dely = fmax( sround * abs(ysav), r0 * ewtj );
+         const ValueType dely = fmax( sround * abs(ysav), r0 / ewtj );
+         y[j] += dely;
+
+         ValueType *jcol = Jy + (j*neq);
+
+         func ( neq, tcur, y, jcol );
+
+         const ValueType delyi = 1. / dely;
+         for (int i = 0; i < neq; ++i)
+            jcol[i] = (jcol[i] - fy[i]) * delyi;
+
+         y[j] = ysav;
+      }
+   }
+
 };
 
 template <typename ValueType>//, SolverTags SolverTag >
@@ -1443,250 +1693,6 @@ struct SimdRosSolverType : public CommonSolverType<_ValueType>
    }
 
    // ROS internal routines ...
-   ValueType getErrorWeight ( const int k, const ValueType *RESTRICT y )
-   {
-      //return (this->s_rtol * abs( y[k] )) + this->s_atol;
-      return 1.0/((this->s_rtol * abs( y[k] )) + this->s_atol);
-   }
-   ValueType wnorm (const ValueType *RESTRICT x, const ValueType *RESTRICT y)
-   {
-      const int neq = this->neq;
-      ValueType sum(0);
-      for (int k = 0; k < neq; k++)
-      {
-         //ValueType prod = x[k] / this->getErrorWeight( k, y );
-         ValueType prod = x[k] * this->getErrorWeight( k, y );
-         sum += (prod*prod);
-      }
-
-      return sqrt(sum / (double)neq);
-   }
-   inline void dzero ( const int len, ValueType *RESTRICT x) const
-   {
-      const ValueType zero(0);
-      for (int k = 0; k < len; ++k)
-         x[k] = zero;
-   }
-   inline void dset ( const int len, ValueType *RESTRICT x, const double sval) const
-   {
-      const ValueType val(sval);
-      for (int k = 0; k < len; ++k)
-         x[k] = sval;
-   }
-   inline void dcopy ( const int len, const ValueType *RESTRICT src, ValueType *RESTRICT dst )
-   {
-      for (int k = 0; k < len; ++k)
-         dst[k] = src[k];
-   }
-   /*inline void dcopy_if (const int len, const MaskType &mask, const __global __ValueType src[], __global __ValueType dst[])
-   {
-      for (int k = 0; k < len; ++k)
-         dst[k] = if_then_else (mask, src[k], dst[k]);
-   }*/
-
-   inline void daxpy1 ( const int len, const double alpha, const ValueType *RESTRICT x, ValueType *RESTRICT y )
-   {
-      // Alpha is scalar type ... and can be easily checked.
-      if (alpha == 1.0)
-      {
-         for (int k = 0; k < len; ++k)
-            y[k] += x[k];
-      }
-      else if (alpha == -1.0)
-      {
-         for (int k = 0; k < len; ++k)
-            y[k] -= x[k];
-      }
-      else if (alpha != 0.0)
-      {
-         for (int k = 0; k < len; ++k)
-            y[k] += alpha * x[k];
-      }
-   }
-   inline void daxpy ( const int len, const ValueType& alpha, const ValueType *RESTRICT x, ValueType *RESTRICT y )
-   {
-      // Alpha is vector type ... tedious to switch.
-      for (int k = 0; k < len; ++k)
-         y[k] += alpha * x[k];
-   }
-
-   int ludec ( const int n, ValueType *RESTRICT A, IndexType *RESTRICT ipiv )
-   {
-      int ierr = ERR_SUCCESS;
-
-      const int nelems = this->vector_length;
-
-      //typedef typename decltype( ipiv[0][0] ) IndexBaseType;
-      typedef int64_t BaseIndexType;
-      alignas(Alignment) BaseIndexType all_pivk[nelems];
-
-      /* k-th elimination step number */
-      for (int k = 0; k < n; ++k)
-      {
-        ValueType *A_k = A + (k*n); // pointer to this column
-
-        /* find pivot row number */
-        for (int el = 0; el < nelems; ++el)
-        {
-           int pivk = k;
-           double Akp = A_k[pivk].extract(el);
-           for (int i = k+1; i < n; ++i)
-           {
-              //const double Aki = __read_from( A_k[__getIndex(i)], el);
-              double Aki = A_k[i].extract(el);
-              if ( fabs(Aki) > fabs(Akp) )
-              {
-                 pivk = i;
-                 Akp = Aki;
-              }
-           }
-
-           // Test for singular value ...
-           if (Akp == 0.0)
-           {
-              ierr = (k+1);
-              //printf("Singular value %d %d\n", k, el);
-              break;
-           }
-
-           /* swap a(k,1:N) and a(piv,1:N) if necessary */
-           if ( pivk != k )
-           {
-              ValueType *A_i = A; // pointer to the first column
-              for (int i = 0; i < n; ++i, A_i += (n))
-              {
-                 const double Aik = A_i[k   ].extract(el);
-                 const double Aip = A_i[pivk].extract(el);
-                 A_i[k   ].insert( el, Aip );
-                 A_i[pivk].insert( el, Aik );
-              }
-           }
-
-           all_pivk[el] = pivk;
-
-        } // End scalar section
-
-        ipiv[k].load_a( all_pivk );
-
-        /* Scale the elements below the diagonal in
-         * column k by 1.0/a(k,k). After the above swap
-         * a(k,k) holds the pivot element. This scaling
-         * stores the pivot row multipliers a(i,k)/a(k,k)
-         * in a(i,k), i=k+1, ..., M-1.
-         */
-        const ValueType mult = 1.0 / A_k[k];
-        for (int i = k+1; i < n; ++i)
-          A_k[i] *= mult;
-
-        /* row_i = row_i - [a(i,k)/a(k,k)] row_k, i=k+1, ..., m-1 */
-        /* row k is the pivot row after swapping with row l.      */
-        /* The computation is done one column at a time,          */
-        /* column j=k+1, ..., n-1.                                */
-
-        for (int j = k+1; j < n; ++j)
-        {
-          ValueType *A_j = A + (j*n);
-          const ValueType a_kj = A_j[k];
-
-          /* a(i,j) = a(i,j) - [a(i,k)/a(k,k)]*a(k,j)  */
-          /* a_kj = a(k,j), col_k[i] = - a(i,k)/a(k,k) */
-          //if (any(a_kj != 0.0)) {
-            for (int i = k+1; i < n; ++i) {
-              A_j[i] -= a_kj * A_k[i];
-            }
-          //}
-        }
-      }
-
-      return ierr;
-      //if (ierr)
-      //{
-      //  fprintf(stderr,"Singular pivot j=%d\n", ierr-1);
-      //  exit(-1);
-      //}
-   }
-
-   void lusol ( const int n, ValueType *RESTRICT A, IndexType *RESTRICT ipiv, ValueType *RESTRICT b)
-   {
-      /* Permute b, based on pivot information in p */
-      for (int k = 0; k < n; ++k)
-      {
-         if ( any( ipiv[k] != IndexType( k ) ) )
-         {
-            for (int el = 0; el < vlen; ++el)
-            {
-               const int pivk = ipiv[k].extract(el);
-               if ( pivk != k )
-               {
-                  const double bk = b[k   ].extract( el);
-                  const double bp = b[pivk].extract( el);
-                  b[k   ].insert( el, bp );
-                  b[pivk].insert( el, bk );
-               }
-            }
-         }
-      }
-
-      /* Solve Ly = b, store solution y in b */
-      for (int k = 0; k < n-1; ++k)
-      {
-         ValueType *A_k = A + (k*n);
-         const ValueType bk = b[k];
-         for (int i = k+1; i < n; ++i)
-            b[i] -= A_k[i] * bk;
-      }
-      /* Solve Ux = y, store solution x in b */
-      for (int k = n-1; k > 0; --k)
-      {
-         ValueType *A_k = A + (k*n);
-         b[k] /= A_k[k];
-         const ValueType bk = b[k];
-         for (int i = 0; i < k; ++i)
-            b[i] -= A_k[i] * bk;
-      }
-      b[0] /= A[0];
-   }
-
-   template <class Functor>
-   void fdjac ( const ValueType& tcur,
-                const ValueType& hcur,
-                      ValueType *RESTRICT y,
-                      ValueType *RESTRICT fy,
-                      ValueType *RESTRICT Jy,
-                      Functor& func )
-   {
-      const int neq = this->neq;
-
-      // Norm of fy(t) ...
-      const ValueType fnorm = this->wnorm( fy, y );
-
-      // Safety factors ...
-      const double sround = std::sqrt( this->uround() );
-      ValueType r0 = (1000. * this->uround() * neq) * (hcur * fnorm);
-      //if (r0 == 0.) r0 = 1.;
-      r0 = select( (r0 == 0.0), ValueType(1), r0 );
-
-      // Build each column vector ...
-      for (int j = 0; j < neq; ++j)
-      {
-         const ValueType ysav = y[j];
-         const ValueType ewtj = this->getErrorWeight( j, y);
-         //const ValueType dely = fmax( sround * abs(ysav), r0 * ewtj );
-         const ValueType dely = fmax( sround * abs(ysav), r0 / ewtj );
-         y[j] += dely;
-
-         ValueType *jcol = Jy + (j*neq);
-
-         func ( neq, tcur, y, jcol );
-
-         const ValueType delyi = 1. / dely;
-         for (int i = 0; i < neq; ++i)
-            jcol[i] = (jcol[i] - fy[i]) * delyi;
-
-         y[j] = ysav;
-      }
-   }
-
    template <class Functor, typename Counters>
    int solve ( ValueType *tcur, ValueType *hcur, Counters* counters, ValueType y[], Functor& func)
    {
