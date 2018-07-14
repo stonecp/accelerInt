@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include <iostream>
 #include <cmath>
 #include <string>
 #include <typeinfo>
@@ -60,16 +61,10 @@ template<> struct VCL_Length<VCL::Vec4d> { enum { length = 4 }; };
 template<> struct VCL_Length<VCL::Vec8d> { enum { length = 8 }; };
 
 template <typename MaskType>
-inline bool all( const MaskType& mask )
-{
-   return horizontal_and( mask );
-}
+inline bool all( const MaskType& mask ) { return horizontal_and( mask ); }
 
 template <typename MaskType>
-inline bool any( const MaskType& mask )
-{
-   return horizontal_or( mask );
-}
+inline bool any( const MaskType& mask ) { return horizontal_or( mask ); }
 
 template <typename SimdType>
 std::string toString (const SimdType& x)
@@ -84,6 +79,42 @@ std::string toString (const SimdType& x)
    oss << "]";
    
    return std::string( oss.str() );
+}
+
+std::ostream& operator<< ( std::ostream& os, const VCL::Vec2d& obj) { return ( os << toString(obj) ); }
+std::ostream& operator<< ( std::ostream& os, const VCL::Vec4d& obj) { return ( os << toString(obj) ); }
+std::ostream& operator<< ( std::ostream& os, const VCL::Vec8d& obj) { return ( os << toString(obj) ); }
+std::ostream& operator<< ( std::ostream& os, const VCL::Vec4i& obj) { return ( os << toString(obj) ); }
+std::ostream& operator<< ( std::ostream& os, const VCL::Vec8i& obj) { return ( os << toString(obj) ); }
+std::ostream& operator<< ( std::ostream& os, const VCL::Vec2q& obj) { return ( os << toString(obj) ); }
+std::ostream& operator<< ( std::ostream& os, const VCL::Vec4q& obj) { return ( os << toString(obj) ); }
+std::ostream& operator<< ( std::ostream& os, const VCL::Vec8q& obj) { return ( os << toString(obj) ); }
+
+std::ostream& operator<< ( std::ostream& os, const VCL::Vec2db& obj) { return ( os << toString(obj) ); }
+std::ostream& operator<< ( std::ostream& os, const VCL::Vec4db& obj) { return ( os << toString(obj) ); }
+std::ostream& operator<< ( std::ostream& os, const VCL::Vec8db& obj) { return ( os << toString(obj) ); }
+std::ostream& operator<< ( std::ostream& os, const VCL::Vec4ib& obj) { return ( os << toString(obj) ); }
+std::ostream& operator<< ( std::ostream& os, const VCL::Vec8ib& obj) { return ( os << toString(obj) ); }
+std::ostream& operator<< ( std::ostream& os, const VCL::Vec2qb& obj) { return ( os << toString(obj) ); }
+std::ostream& operator<< ( std::ostream& os, const VCL::Vec4qb& obj) { return ( os << toString(obj) ); }
+std::ostream& operator<< ( std::ostream& os, const VCL::Vec8qb& obj) { return ( os << toString(obj) ); }
+
+template <typename ValueType, int VectorLength>
+inline
+std::ostream& operator<< ( std::ostream& os,
+                           const typename VCL_TypeSelector<ValueType,VectorLength>::value_type& obj )
+{
+   // stream obj's data into os
+   os << toString(obj);
+   /*const int len = SimdType::size();
+   std::ostringstream oss;
+   os << "[";
+   for (int i = 0; i < len; ++i) {
+      os << x[i];
+      if (i != len-1) oss << ",";
+   }
+   os << "]";*/
+   return os;
 }
 
 // Internal utility functions ...
@@ -757,28 +788,314 @@ void test_simd_rhs ( const int numProblems, const double *u_in, Func& func, cons
    return;
 }
 
-template <typename ValueType>
-struct simd_rk_solver_type : public rk_t
-{
-   enum { vlen = VCL_Length<ValueType>::length };
+enum SolverTags { RKF45 = 1, ROS4 };
 
+enum ErrorFlags { ERR_SUCCESS         = 0,
+                  ERR_TOO_MUCH_WORK   = 1,
+                  ERR_TDIST_TOO_SMALL = 2,
+                  ERR_HIN_MAX_ITERS   = 3 };
+
+const ErrorFlags GetErrorInt ( const int errflag )
+{
+   switch ( errflag )
+   {
+      case ( int(ERR_SUCCESS) ) :
+         return ERR_SUCCESS;
+      case ( ERR_TOO_MUCH_WORK ) :
+         return ERR_TOO_MUCH_WORK;
+      case ( ERR_TDIST_TOO_SMALL ) :
+         return ERR_TDIST_TOO_SMALL;
+      case ( ERR_HIN_MAX_ITERS ) :
+         return ERR_HIN_MAX_ITERS;
+      default:
+      {
+         fprintf(stderr,"Unknown error value: %d\n", errflag);
+         exit(2);
+      }
+   }
+}
+const char* GetErrorString ( const ErrorFlags& errflag )
+{
+   switch ( errflag )
+   {
+      case ( ERR_SUCCESS ) :
+      {
+         static const char* flag = "Success (None)";
+         return flag;
+      }
+      case ( ERR_TOO_MUCH_WORK ) :
+      {
+         static const char* flag = "Too much work in solver";
+         return flag;
+      }
+      case ( ERR_TDIST_TOO_SMALL ) :
+      {
+         static const char* flag = "Time too small; not resolvable";
+         return flag;
+      }
+      case ( ERR_HIN_MAX_ITERS ) :
+      {
+         static const char* flag = "Exceeded maximum hin() iterations";
+         return flag;
+      }
+   }
+}
+const char* GetErrorString ( const int errflag )
+{
+   return GetErrorString( GetErrorInt(errflag) );
+}
+
+template <typename T>
+struct CommonSolverType
+{
+   typedef T ValueType;
    typedef typename VCL_MaskSelector< ValueType >::mask_type MaskType;
 
-   struct Counters
+   enum { vector_length = VCL_Length<ValueType>::length,
+          vlen = vector_length };
+
+   struct CountersType
    {
+      typedef typename VCL_TypeSelector<int64_t,vlen>::value_type IndexType;
       int nit;
-      typename VCL_TypeSelector<int64_t,vlen>::value_type nst;
-      typename VCL_TypeSelector<int64_t,vlen>::value_type errflag;
+      IndexType nst;
+      IndexType nfe;
+      IndexType nje;
+      IndexType nlu;
+      IndexType errflag;
    };
 
-   VectorType<ValueType,Alignment> m_rwk;
+   int neq;
 
-   simd_rk_solver_type(const int _neq)
-      : rk_t()
+   int itol;
+   double s_rtol, s_atol;
+ //double v_rtol[], v_atol[];
+
+   int max_iters, min_iters;
+
+   double adaption_limit;
+
+   double h_min, h_max;
+   double t_round;
+   double t_stop;
+
+   inline double uround(void) const { return DBL_EPSILON; }
+
+   CommonSolverType (const int _neq)
+      : neq(_neq),
+        min_iters(1), max_iters(100),
+        h_min(0), h_max(0),
+        adaption_limit(4),
+        itol(1),
+        s_rtol(1.0e-11), s_atol(1.0e-9),
+        t_stop(-1)
+   {}
+
+   virtual ~CommonSolverType()
+   {}
+
+private:
+   CommonSolverType (void);
+
+public:
+   int init (const double t0, const double t_stop)
    {
-      rk_create( (rk_t *) this, _neq );
-      m_rwk.resize( rk_lenrwk( (rk_t *) this ) );
+      this->t_stop = t_stop;
+
+      this->h_min = 0.0;
+      this->h_max = 0.0;
+
+      const double t_dist = this->t_stop - t0;
+      this->t_round = t_dist * this->uround();
+
+      if (t_dist < (this->t_round * 2.0))
+      {
+         //fprintf(stderr, "error: tdist < 2.0 * tround %e\n", tdist);
+         return RK_TDIST_TOO_SMALL;
+      }
+
+      if (this->h_min < this->t_round) this->h_min = this->t_round * 100.0;
+      if (this->h_max < this->t_round) this->h_max = t_dist / (double)this->min_iters;
+
+      return ERR_SUCCESS;
    }
+
+   ValueType wnorm (const ValueType *RESTRICT x, const ValueType *RESTRICT y)
+   {
+      const int neq = this->neq;
+      ValueType sum = 0;
+      for (int k = 0; k < neq; k++)
+      {
+         ValueType ewt = (this->s_rtol * abs(y[k])) + this->s_atol;
+         ValueType prod = x[k] / ewt;
+         sum += (prod*prod);
+      }
+
+      const double denom = 1.0 / neq;
+      return sqrt(sum * denom);
+   }
+
+   template <class Functor>
+   int hin ( const ValueType t, ValueType *h0, ValueType *RESTRICT y, ValueType *RESTRICT rwk, Functor& func)
+   {
+      //value_type tround = tdist * this->uround();
+      //double tdist = t_stop - t;
+      //double tround = tdist * rk_uround();
+
+      // Set lower and upper bounds on h0, and take geometric mean as first trial value.
+      // Exit with this value if the bounds cross each other.
+
+      //rk->h_min = fmax(tround * 100.0, rk->h_min);
+      //rk->h_max = fmin(tdist, rk->h_max);
+
+      //const int neq = this->neq;
+
+      ValueType *RESTRICT ydot  = rwk;
+      ValueType *RESTRICT y1    = ydot + neq;
+      ValueType *RESTRICT ydot1 = y1 + neq;
+
+      int need_ydot = 1;
+
+      // Adjust upper bound based on ydot ...
+   /*    if (0)
+         {
+            need_ydot = false;
+
+            // compute ydot at t=t0
+            func (neq, y, ydot);
+            ++this->nfe;
+
+            for (int k = 0; k < neq; k++)
+            {
+               value_type dely = 0.1 * fabs(y[k]) + this->atol;
+               value_type hub0 = hub;
+               if (hub * fabs(ydot[k]) > dely) hub = dely / fabs(ydot[k]);
+               //printf("k=%d, hub0 = %e, hub = %e\n", k, hub0, hub);
+            }
+         }*/
+
+      double hlb = this->h_min;
+      double hub = this->h_max;
+
+      ValueType hg = std::sqrt(hlb*hub);
+
+      if (hub < hlb)
+      {
+         *h0 = hg;
+         return ERR_SUCCESS;
+      }
+
+      // Start iteration to find solution to ... {WRMS norm of (h0^2 y'' / 2)} = 1
+
+      const int miters = 10;
+      MaskType hnew_is_ok( false );
+      ValueType hnew = hg;
+      int iter = 0;
+      int ierr = ERR_SUCCESS;
+
+      // compute ydot at t=t0
+      if (need_ydot)
+      {
+         func(neq, 0.0, y, ydot);
+         //++rk->nfe;
+         need_ydot = 0;
+      }
+
+      while(1)
+      {
+         // Estimate y'' with finite-difference ...
+         //double t1 = hg;
+
+         #pragma ivdep
+         for (int k = 0; k < neq; k++)
+            y1[k] = y[k] + hg * ydot[k];
+
+         // compute y' at t1
+         func (neq, 0.0, y1, ydot1);
+         //++rk->nfe;
+
+         // Compute WRMS norm of y''
+         #pragma ivdep
+         for (int k = 0; k < neq; k++)
+            y1[k] = (ydot1[k] - ydot[k]) / hg;
+
+         ValueType yddnrm = this->wnorm ( y1, y );
+
+         //std::cout << "iter " << iter << " hg " << hg << " y'' " << yddnrm << std::endl;
+         //std::cout << "ydot " << ydot[neq-1] << std::endl;
+
+         // should we accept this?
+         hnew = select( hnew_is_ok | MaskType( iter == miters ), hg, hnew );
+         if ( all(hnew_is_ok) )
+         {
+            ierr = ERR_SUCCESS;
+            break;
+         }
+         else if (iter == miters)
+         {
+            ierr = ERR_HIN_MAX_ITERS;
+            break;
+         }
+
+         // Get the new value of h ...
+         {
+            auto mask = (yddnrm*hub*hub > ValueType(2.0));
+            hnew = select( mask, sqrt(2.0 / yddnrm), sqrt(hg * hub) );
+         }
+
+         // test the stopping conditions.
+         ValueType hrat = hnew / hg;
+
+         // Accept this value ... the bias factor should bring it within range.
+         hnew_is_ok = (hrat > 0.5) && (hrat < 2.0);
+
+         // If y'' is still bad after a few iterations, just accept h and give up.
+         if ( iter > 1 ) {
+            //hnew_is_ok = (hrat > 2.0);
+            //hnew = select( hnew_is_ok, hg, hnew );
+            auto mask = (hrat > 2.0);
+            hnew = select( mask, hg, hnew );
+            //hnew_is_ok = select( mask, mask, hnew_is_ok );
+            hnew_is_ok |= mask;
+         }
+
+         //printf("iter=%d, yddnrw=%e, hnew=%e, hlb=%e, hub=%e\n", iter, yddnrm, hnew, hlb, hub);
+
+         hg = hnew;
+         iter ++;
+      }
+
+      // bound and bias estimate
+      *h0 = hnew * 0.5;
+      *h0 = max(*h0, hlb);
+      *h0 = min(*h0, hub);
+
+      //printf("h0=%e, hlb=%e, hub=%e\n", h0, hlb, hub);
+
+      return ierr;
+   }
+};
+
+template <typename ValueType>//, SolverTags SolverTag >
+struct SimdERKSolverType : public CommonSolverType<ValueType>
+{
+   typedef CommonSolverType<ValueType> Parent;
+
+   enum { vlen = Parent::vlen };
+
+   typedef typename Parent::MaskType MaskType;
+   typedef typename Parent::CountersType CountersType;
+
+   VectorType<ValueType> m_rwk;
+
+   SimdERKSolverType(const int _neq)
+      : Parent(_neq)
+   {
+      m_rwk.resize( get_lenrwk() );
+   }
+
+   constexpr size_t get_lenrwk(const int _neq) const { return (8 * _neq); }
+   constexpr size_t get_lenrwk(void) const { return (8 * this->neq); }
 
    template <class Functor>
    int oneStep (const ValueType& h,
@@ -818,6 +1135,8 @@ struct simd_rk_solver_type : public rk_t
                    b4 = 0.50613149034201,
                    b5 =-0.18,
                    b6 = 0.036363636363636;
+
+      const int neq = this->neq;
 
       // local dependent variables (5 total)
       ValueType *RESTRICT f1   = rwk ;
@@ -896,173 +1215,13 @@ struct simd_rk_solver_type : public rk_t
          y_out[k] = y[k] + r5; // Local extrapolation
       }
 
-      return RK_SUCCESS;
-   }
-
-   ValueType wnorm (const ValueType *RESTRICT x, const ValueType *RESTRICT y)
-   {
-      const int neq = this->neq;
-      ValueType sum = 0;
-      for (int k = 0; k < neq; k++)
-      {
-         ValueType ewt = (this->s_rtol * abs(y[k])) + this->s_atol;
-         ValueType prod = x[k] / ewt;
-         sum += (prod*prod);
-      }
-
-      const double denom = 1.0 / neq;
-      return sqrt(sum * denom);
-   }
-
-   template <class Functor>
-   int hin ( const ValueType t, ValueType *h0, ValueType *RESTRICT y, ValueType *RESTRICT rwk, Functor& func)
-   {
-      //value_type tround = tdist * this->uround();
-      //double tdist = t_stop - t;
-      //double tround = tdist * rk_uround();
-
-      // Set lower and upper bounds on h0, and take geometric mean as first trial value.
-      // Exit with this value if the bounds cross each other.
-
-      //rk->h_min = fmax(tround * 100.0, rk->h_min);
-      //rk->h_max = fmin(tdist, rk->h_max);
-
-      const int neq = this->neq;
-
-      ValueType *RESTRICT ydot  = rwk;
-      ValueType *RESTRICT y1    = ydot + neq;
-      ValueType *RESTRICT ydot1 = y1 + neq;
-
-      int need_ydot = 1;
-
-      // Adjust upper bound based on ydot ...
-   /*    if (0)
-         {
-            need_ydot = false;
-
-            // compute ydot at t=t0
-            func (neq, y, ydot);
-            ++this->nfe;
-
-            for (int k = 0; k < neq; k++)
-            {
-               value_type dely = 0.1 * fabs(y[k]) + this->atol;
-               value_type hub0 = hub;
-               if (hub * fabs(ydot[k]) > dely) hub = dely / fabs(ydot[k]);
-               //printf("k=%d, hub0 = %e, hub = %e\n", k, hub0, hub);
-            }
-         }*/
-
-      double hlb = this->h_min;
-      double hub = this->h_max;
-
-      ValueType hg = std::sqrt(hlb*hub);
-
-      if (hub < hlb)
-      {
-         *h0 = hg;
-         return RK_SUCCESS;
-      }
-
-      // Start iteration to find solution to ... {WRMS norm of (h0^2 y'' / 2)} = 1
-
-      const int miters = 10;
-      MaskType hnew_is_ok( false );
-      ValueType hnew = hg;
-      int iter = 0;
-      int ierr = RK_SUCCESS;
-
-      // compute ydot at t=t0
-      if (need_ydot)
-      {
-         func(neq, 0.0, y, ydot);
-         //++rk->nfe;
-         need_ydot = 0;
-      }
-
-      while(1)
-      {
-         // Estimate y'' with finite-difference ...
-         //double t1 = hg;
-
-         #pragma ivdep
-         for (int k = 0; k < neq; k++)
-            y1[k] = y[k] + hg * ydot[k];
-
-         // compute y' at t1
-         func (neq, 0.0, y1, ydot1);
-         //++rk->nfe;
-
-         // Compute WRMS norm of y''
-         #pragma ivdep
-         for (int k = 0; k < neq; k++)
-            y1[k] = (ydot1[k] - ydot[k]) / hg;
-
-         ValueType yddnrm = this->wnorm ( y1, y );
-
-         //std::cout << "iter " << iter << " hg " << hg << " y'' " << yddnrm << std::endl;
-         //std::cout << "ydot " << ydot[neq-1] << std::endl;
-
-         // should we accept this?
-         hnew = select( hnew_is_ok | MaskType( iter == miters ), hg, hnew );
-         if ( all(hnew_is_ok) )
-         {
-            ierr = RK_SUCCESS;
-            break;
-         }
-         else if (iter == miters)
-         {
-            ierr = RK_HIN_MAX_ITERS;
-            break;
-         }
-
-         // Get the new value of h ...
-         {
-            auto mask = (yddnrm*hub*hub > ValueType(2.0));
-            hnew = select( mask, sqrt(2.0 / yddnrm), sqrt(hg * hub) );
-         }
-
-         // test the stopping conditions.
-         ValueType hrat = hnew / hg;
-
-         // Accept this value ... the bias factor should bring it within range.
-         hnew_is_ok = (hrat > 0.5) && (hrat < 2.0);
-
-         // If y'' is still bad after a few iterations, just accept h and give up.
-         if ( iter > 1 ) {
-            //hnew_is_ok = (hrat > 2.0);
-            //hnew = select( hnew_is_ok, hg, hnew );
-            auto mask = (hrat > 2.0);
-            hnew = select( mask, hg, hnew );
-            //hnew_is_ok = select( mask, mask, hnew_is_ok );
-            hnew_is_ok |= mask;
-         }
-
-         //printf("iter=%d, yddnrw=%e, hnew=%e, hlb=%e, hub=%e\n", iter, yddnrm, hnew, hlb, hub);
-
-         hg = hnew;
-         iter ++;
-      }
-
-      // bound and bias estimate
-      *h0 = hnew * 0.5;
-      *h0 = max(*h0, hlb);
-      *h0 = min(*h0, hub);
-
-      //printf("h0=%e, hlb=%e, hub=%e\n", h0, hlb, hub);
-
-      return ierr;
-   }
-
-   int init (double t0, double t_stop)
-   {
-      rk_init( (rk_t *)this, t0, t_stop );
+      return ERR_SUCCESS;
    }
 
    template <typename Functor, typename Counters>
    int solve (ValueType* tcur, ValueType *hcur, Counters* counters, ValueType y[], Functor& func)
    {
-      int ierr = RK_SUCCESS;
+      int ierr = ERR_SUCCESS;
 
       ValueType *rwk = m_rwk.getPointer();
 
@@ -1072,12 +1231,14 @@ struct simd_rk_solver_type : public rk_t
          if ( any(mask) )
          {
             ValueType h0 = *hcur;
+            //std::cout << "Before hin: " << h0 << ", " << mask << "\n";
             ierr = this->hin ( *tcur, &h0, y, rwk, func );
-            if (ierr != RK_SUCCESS)
+            if (ierr != ERR_SUCCESS)
             {
-               printf("Failure in hin %d\n", ierr);
+               fprintf(stderr,"Failure solve(): %d %s\n", ierr, GetErrorString(ierr));
                return ierr;
             }
+            //std::cout << "After hin: " << h0 << "\n";
 
             *hcur = select( mask, h0, *hcur );
          }
@@ -1096,7 +1257,7 @@ struct simd_rk_solver_type : public rk_t
 
       while (  any(not_done) )
       {
-         ValueType *ytry = rwk + neq*7;
+         ValueType *ytry = rwk + this->neq*7;
 
          // Take a trial step over h_cur ...
          this->oneStep ( h, y, ytry, rwk, func );
@@ -1112,7 +1273,7 @@ struct simd_rk_solver_type : public rk_t
             t   = select ( accept, t + h, t   );
             nst = select ( accept, nst+1, nst );
 
-            for (int k = 0; k < neq; k++)
+            for (int k = 0; k < this->neq; k++)
                y[k] = select( accept, ytry[k], y[k] );
 
             not_done = abs(t - this->t_stop) > this->t_round;
@@ -1126,7 +1287,7 @@ struct simd_rk_solver_type : public rk_t
 
 #if defined(VERBOSE) && (VERBOSE > 0)
          if (iter % 10 == 0)
-            printf("iter = %d: accept=%s, not_done=%s t=%s, fact=%s %s %s\n", iter, toString(accept).c_str(), toString(not_done).c_str(), toString(t).c_str(), toString(fact).c_str(), toString(y[neq-1]).c_str(), toString(h).c_str());
+            printf("iter = %d: accept=%s, not_done=%s t=%s, fact=%s %s %s\n", iter, toString(accept).c_str(), toString(not_done).c_str(), toString(t).c_str(), toString(fact).c_str(), toString(y[this->neq-1]).c_str(), toString(h).c_str());
 #endif
 
          // Apply grow/shrink factor for next step.
@@ -1145,7 +1306,7 @@ struct simd_rk_solver_type : public rk_t
          ++iter;
          if ( this->max_iters && iter > this->max_iters )
          {
-            ierr = RK_TOO_MUCH_WORK;
+            ierr = ERR_TOO_MUCH_WORK;
             //printf("(iter > max_iters)\n");
             break;
          }
@@ -1243,8 +1404,10 @@ void simd_rk_driver ( const int numProblems, const double *u_in, const double t_
    double time_vector = WallClock();
 
    simd_cklib_functor<SimdType> simd_func( ck, p );
-   simd_rk_solver_type<SimdType> simd_solver( neq );
-   //simd_solver.max_iters=100;
+   //SimdERKSolverType<SimdType> simd_solver( neq );
+   typedef SimdERKSolverType<SimdType> SimdSolverType;
+   SimdSolverType simd_solver( neq );
+   simd_solver.max_iters=200;
 
    for (int i0 = 0; i0 < numProblems; i0 += VectorLength)
    {
@@ -1262,10 +1425,17 @@ void simd_rk_driver ( const int numProblems, const double *u_in, const double t_
          SimdType T0 = v_u[ getTempIndex(neq) ];
 
          SimdType t(0), h(0);
-         typename simd_rk_solver_type<SimdType>::Counters counters;
+         typename SimdSolverType::CountersType counters;
 
          simd_solver.init( 0.0, t_stop );
-         simd_solver.solve ( &t, &h, &counters, v_u, simd_func );
+         int ierr = simd_solver.solve ( &t, &h, &counters, v_u, simd_func );
+         if (ierr != ERR_SUCCESS)
+         {
+            fprintf(stderr,"%d: simd_solver error %d %s\n", i0, ierr, GetErrorString(ierr));
+            if (ierr == ERR_TOO_MUCH_WORK)
+               fprintf(stderr,"--: simd_solver nit= %d %s\n", counters.nit, toString(counters.nst).c_str());
+            exit(-1);
+         }
 
          for (int i = 0; i < VectorLength; ++i)
          {
