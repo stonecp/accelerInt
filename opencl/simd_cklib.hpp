@@ -144,17 +144,12 @@ inline ValueType __powi( const ValueType& x, const int p )
 }
 
 template <typename ValueType>
-inline ValueType fmax( const ValueType& a, const ValueType& b )
-{
-   auto mask = a > b;
-   return select( mask, a, b );
-}
+inline ValueType fmax( const ValueType& a, const ValueType& b ) { return select( a > b, a, b ); }
 template <typename ValueType>
-inline ValueType fmax( const ValueType& a, const double b )
-{
-   auto mask = a > ValueType(b);
-   return select( mask, a, b );
-}
+inline ValueType fmax( const ValueType& a, const double b ) { return select( a > ValueType(b), a, b); }
+template <typename ValueType>
+inline ValueType fmax( const double a, const ValueType& b ) { return fmax(b,a); }
+
 template <typename ValueType>
 inline ValueType fmin( const ValueType& a, const ValueType& b )
 {
@@ -849,14 +844,15 @@ template <typename T>
 struct CommonSolverType
 {
    typedef T ValueType;
-   typedef typename VCL_MaskSelector< ValueType >::mask_type MaskType;
+   typedef typename VCL_MaskSelector< ValueType >::mask_type   MaskType;
 
    enum { vector_length = VCL_Length<ValueType>::length,
           vlen = vector_length };
 
+   typedef typename VCL_TypeSelector<int64_t,vlen>::value_type IndexType;
+
    struct CountersType
    {
-      typedef typename VCL_TypeSelector<int64_t,vlen>::value_type IndexType;
       int nit;
       IndexType nst;
       IndexType nfe;
@@ -883,7 +879,7 @@ struct CommonSolverType
 
    CommonSolverType (const int _neq)
       : neq(_neq),
-        min_iters(1), max_iters(100),
+        min_iters(1), max_iters(1000),
         h_min(0), h_max(0),
         adaption_limit(4),
         itol(1),
@@ -1321,6 +1317,629 @@ struct SimdERKSolverType : public CommonSolverType<ValueType>
    }
 };
 
+template <typename _ValueType>//, SolverTags SolverTag >
+struct SimdRosSolverType : public CommonSolverType<_ValueType>
+{
+   enum SolverTags { Ros3, Ros4, Rodas3, Rodas4 };
+
+   enum { _maxStages = 6 };
+
+   typedef CommonSolverType<_ValueType> Parent;
+
+   enum { vlen = Parent::vlen };
+
+   typedef typename Parent::ValueType    ValueType;
+   typedef typename Parent::MaskType     MaskType;
+   typedef typename Parent::CountersType CountersType;
+   typedef typename Parent::IndexType    IndexType;
+
+   VectorType<ValueType> m_rwk;
+   VectorType<IndexType> m_iwk;
+
+   SolverTags solverTag;
+   int numStages;
+   int ELO;
+   double A[_maxStages*(_maxStages-1)/2];
+   double C[_maxStages*(_maxStages-1)/2];
+   int newFunc[_maxStages];
+   double E[_maxStages];
+   double M[_maxStages];
+   double alpha[_maxStages];
+   double gamma[_maxStages];
+
+   SimdRosSolverType( const int _neq, const SolverTags& _tag = Ros4 )
+      : Parent(_neq),
+        solverTag( _tag )
+   {
+      if (solverTag == Ros4)
+         this->setRos4();
+      else
+      {
+         fprintf(stderr,"Invalid solverTag = %d\n", solverTag);
+         exit(1);
+      }
+
+      // lenrwk function uses subspace lengths.
+      m_rwk.resize( this->get_lenrwk() );
+      m_iwk.resize( this->get_leniwk() );
+   }
+
+   constexpr size_t get_lenrwk(const int _neq) const
+   {
+      int lenrwk = 0;
+      lenrwk +=  _neq;		// fy
+      lenrwk +=  _neq;		// ynew & yerr
+      lenrwk += (_neq * _neq);	// Jy
+    //lenrwk +=  _neq;		// ewt
+      lenrwk +=  _neq * this->numStages;// ktmp
+
+      return lenrwk;
+   }
+
+   constexpr size_t get_leniwk(const int _neq) const
+   {
+      return (_neq); // ipiv
+   }
+
+   constexpr size_t get_lenrwk(void) const { return this->get_lenrwk(this->neq); }
+   constexpr size_t get_leniwk(void) const { return this->get_leniwk(this->neq); }
+
+   // 4th/3rd-order L-stable Rosenbrock method with 4 stages.
+   // -- E. Hairer and G. Wanner, "Solving ordinary differential equations II:
+   //    stiff and differential-algebraic problems," Springer series in
+   //    computational mathematics, Springer-Verlag (1990).
+   void setRos4 (void)
+   {
+      this->solverTag = Ros4;
+      this->numStages = 4;
+      this->ELO = 4;
+
+      // A and C are strictly lower-triangular matrices in row-major order!!!!
+      // -- A(i,j) = [(i)*(i-1)/2 + j] ... A(1,0) = A[0], A(2,0) = A[1]
+      this->A[0] = 2.0;
+      this->A[1] = 1.867943637803922;
+      this->A[2] = 0.2344449711399156;
+      this->A[3] = this->A[1];
+      this->A[4] = this->A[2];
+      this->A[5] = 0.0;
+
+      this->C[0] =-7.137615036412310;
+      this->C[1] = 2.580708087951457;
+      this->C[2] = 0.6515950076447975;
+      this->C[3] =-2.137148994382534;
+      this->C[4] =-0.3214669691237626;
+      this->C[5] =-0.6949742501781779;
+
+      // Does the stage[i] need a new function eval or can it reuse the
+      // prior one from stage[i-1]?
+      this->newFunc[0] = 1;
+      this->newFunc[1] = 1;
+      this->newFunc[2] = 1;
+      this->newFunc[3] = 0;
+
+      // M_i = Coefficients for new step solution
+      this->M[0] = 2.255570073418735;
+      this->M[1] = 0.2870493262186792;
+      this->M[2] = 0.4353179431840180;
+      this->M[3] = 1.093502252409163;
+
+      // E_i = Coefficients for error estimator
+      this->E[0] =-0.2815431932141155;
+      this->E[1] =-0.07276199124938920;
+      this->E[2] =-0.1082196201495311;
+      this->E[3] =-1.093502252409163;
+
+      // Y( T + h*alpha_i )
+      this->alpha[0] = 0.0;
+      this->alpha[1] = 1.14564;
+      this->alpha[2] = 0.65521686381559;
+      this->alpha[3] = this->alpha[2];
+
+      // gamma_i = \Sum_j  gamma_{i,j}
+      this->gamma[0] = 0.57282;
+      this->gamma[1] =-1.769193891319233;
+      this->gamma[2] = 0.7592633437920482;
+      this->gamma[3] =-0.104902108710045;
+   }
+
+   // ROS internal routines ...
+   ValueType getErrorWeight ( const int k, const ValueType *RESTRICT y )
+   {
+      //return (this->s_rtol * abs( y[k] )) + this->s_atol;
+      return 1.0/((this->s_rtol * abs( y[k] )) + this->s_atol);
+   }
+   ValueType wnorm (const ValueType *RESTRICT x, const ValueType *RESTRICT y)
+   {
+      const int neq = this->neq;
+      ValueType sum(0);
+      for (int k = 0; k < neq; k++)
+      {
+         //ValueType prod = x[k] / this->getErrorWeight( k, y );
+         ValueType prod = x[k] * this->getErrorWeight( k, y );
+         sum += (prod*prod);
+      }
+
+      return sqrt(sum / (double)neq);
+   }
+   inline void dzero ( const int len, ValueType *RESTRICT x) const
+   {
+      const ValueType zero(0);
+      for (int k = 0; k < len; ++k)
+         x[k] = zero;
+   }
+   inline void dset ( const int len, ValueType *RESTRICT x, const double sval) const
+   {
+      const ValueType val(sval);
+      for (int k = 0; k < len; ++k)
+         x[k] = sval;
+   }
+   inline void dcopy ( const int len, const ValueType *RESTRICT src, ValueType *RESTRICT dst )
+   {
+      for (int k = 0; k < len; ++k)
+         dst[k] = src[k];
+   }
+   /*inline void dcopy_if (const int len, const MaskType &mask, const __global __ValueType src[], __global __ValueType dst[])
+   {
+      for (int k = 0; k < len; ++k)
+         dst[k] = if_then_else (mask, src[k], dst[k]);
+   }*/
+
+   inline void daxpy1 ( const int len, const double alpha, const ValueType *RESTRICT x, ValueType *RESTRICT y )
+   {
+      // Alpha is scalar type ... and can be easily checked.
+      if (alpha == 1.0)
+      {
+         for (int k = 0; k < len; ++k)
+            y[k] += x[k];
+      }
+      else if (alpha == -1.0)
+      {
+         for (int k = 0; k < len; ++k)
+            y[k] -= x[k];
+      }
+      else if (alpha != 0.0)
+      {
+         for (int k = 0; k < len; ++k)
+            y[k] += alpha * x[k];
+      }
+   }
+   inline void daxpy ( const int len, const ValueType& alpha, const ValueType *RESTRICT x, ValueType *RESTRICT y )
+   {
+      // Alpha is vector type ... tedious to switch.
+      for (int k = 0; k < len; ++k)
+         y[k] += alpha * x[k];
+   }
+
+   int ludec ( const int n, ValueType *RESTRICT A, IndexType *RESTRICT ipiv )
+   {
+      int ierr = ERR_SUCCESS;
+
+      const int nelems = this->vector_length;
+
+      //typedef typename decltype( ipiv[0][0] ) IndexBaseType;
+      typedef int64_t BaseIndexType;
+      alignas(Alignment) BaseIndexType all_pivk[nelems];
+
+      /* k-th elimination step number */
+      for (int k = 0; k < n; ++k)
+      {
+        ValueType *A_k = A + (k*n); // pointer to this column
+
+        /* find pivot row number */
+        for (int el = 0; el < nelems; ++el)
+        {
+           int pivk = k;
+           double Akp = A_k[pivk].extract(el);
+           for (int i = k+1; i < n; ++i)
+           {
+              //const double Aki = __read_from( A_k[__getIndex(i)], el);
+              double Aki = A_k[i].extract(el);
+              if ( fabs(Aki) > fabs(Akp) )
+              {
+                 pivk = i;
+                 Akp = Aki;
+              }
+           }
+
+           // Test for singular value ...
+           if (Akp == 0.0)
+           {
+              ierr = (k+1);
+              //printf("Singular value %d %d\n", k, el);
+              break;
+           }
+
+           /* swap a(k,1:N) and a(piv,1:N) if necessary */
+           if ( pivk != k )
+           {
+              ValueType *A_i = A; // pointer to the first column
+              for (int i = 0; i < n; ++i, A_i += (n))
+              {
+                 const double Aik = A_i[k   ].extract(el);
+                 const double Aip = A_i[pivk].extract(el);
+                 A_i[k   ].insert( el, Aip );
+                 A_i[pivk].insert( el, Aik );
+              }
+           }
+
+           all_pivk[el] = pivk;
+
+        } // End scalar section
+
+        ipiv[k].load_a( all_pivk );
+
+        /* Scale the elements below the diagonal in
+         * column k by 1.0/a(k,k). After the above swap
+         * a(k,k) holds the pivot element. This scaling
+         * stores the pivot row multipliers a(i,k)/a(k,k)
+         * in a(i,k), i=k+1, ..., M-1.
+         */
+        const ValueType mult = 1.0 / A_k[k];
+        for (int i = k+1; i < n; ++i)
+          A_k[i] *= mult;
+
+        /* row_i = row_i - [a(i,k)/a(k,k)] row_k, i=k+1, ..., m-1 */
+        /* row k is the pivot row after swapping with row l.      */
+        /* The computation is done one column at a time,          */
+        /* column j=k+1, ..., n-1.                                */
+
+        for (int j = k+1; j < n; ++j)
+        {
+          ValueType *A_j = A + (j*n);
+          const ValueType a_kj = A_j[k];
+
+          /* a(i,j) = a(i,j) - [a(i,k)/a(k,k)]*a(k,j)  */
+          /* a_kj = a(k,j), col_k[i] = - a(i,k)/a(k,k) */
+          //if (any(a_kj != 0.0)) {
+            for (int i = k+1; i < n; ++i) {
+              A_j[i] -= a_kj * A_k[i];
+            }
+          //}
+        }
+      }
+
+      return ierr;
+      //if (ierr)
+      //{
+      //  fprintf(stderr,"Singular pivot j=%d\n", ierr-1);
+      //  exit(-1);
+      //}
+   }
+
+   void lusol ( const int n, ValueType *RESTRICT A, IndexType *RESTRICT ipiv, ValueType *RESTRICT b)
+   {
+      /* Permute b, based on pivot information in p */
+      for (int k = 0; k < n; ++k)
+      {
+         if ( any( ipiv[k] != IndexType( k ) ) )
+         {
+            for (int el = 0; el < vlen; ++el)
+            {
+               const int pivk = ipiv[k].extract(el);
+               if ( pivk != k )
+               {
+                  const double bk = b[k   ].extract( el);
+                  const double bp = b[pivk].extract( el);
+                  b[k   ].insert( el, bp );
+                  b[pivk].insert( el, bk );
+               }
+            }
+         }
+      }
+
+      /* Solve Ly = b, store solution y in b */
+      for (int k = 0; k < n-1; ++k)
+      {
+         ValueType *A_k = A + (k*n);
+         const ValueType bk = b[k];
+         for (int i = k+1; i < n; ++i)
+            b[i] -= A_k[i] * bk;
+      }
+      /* Solve Ux = y, store solution x in b */
+      for (int k = n-1; k > 0; --k)
+      {
+         ValueType *A_k = A + (k*n);
+         b[k] /= A_k[k];
+         const ValueType bk = b[k];
+         for (int i = 0; i < k; ++i)
+            b[i] -= A_k[i] * bk;
+      }
+      b[0] /= A[0];
+   }
+
+   template <class Functor>
+   void fdjac ( const ValueType& tcur,
+                const ValueType& hcur,
+                      ValueType *RESTRICT y,
+                      ValueType *RESTRICT fy,
+                      ValueType *RESTRICT Jy,
+                      Functor& func )
+   {
+      const int neq = this->neq;
+
+      // Norm of fy(t) ...
+      const ValueType fnorm = this->wnorm( fy, y );
+
+      // Safety factors ...
+      const double sround = std::sqrt( this->uround() );
+      ValueType r0 = (1000. * this->uround() * neq) * (hcur * fnorm);
+      //if (r0 == 0.) r0 = 1.;
+      r0 = select( (r0 == 0.0), ValueType(1), r0 );
+
+      // Build each column vector ...
+      for (int j = 0; j < neq; ++j)
+      {
+         const ValueType ysav = y[j];
+         const ValueType ewtj = this->getErrorWeight( j, y);
+         //const ValueType dely = fmax( sround * abs(ysav), r0 * ewtj );
+         const ValueType dely = fmax( sround * abs(ysav), r0 / ewtj );
+         y[j] += dely;
+
+         ValueType *jcol = Jy + (j*neq);
+
+         func ( neq, tcur, y, jcol );
+
+         const ValueType delyi = 1. / dely;
+         for (int i = 0; i < neq; ++i)
+            jcol[i] = (jcol[i] - fy[i]) * delyi;
+
+         y[j] = ysav;
+      }
+   }
+
+   template <class Functor, typename Counters>
+   int solve ( ValueType *tcur, ValueType *hcur, Counters* counters, ValueType y[], Functor& func)
+   {
+      int ierr = ERR_SUCCESS;
+
+      const int neq = this->neq;
+
+      #define nst (counters->nst)
+      #define nfe (counters->nfe)
+      #define nje (counters->nje)
+      #define nlu (counters->nlu)
+      #define iter (counters->nit)
+      #define h (*hcur)
+      #define t (*tcur)
+      #define A(_i,_j) (this->A[ (((_i)-1)*(_i))/2 + (_j) ] )
+      #define C(_i,_j) (this->C[ (((_i)-1)*(_i))/2 + (_j) ] )
+
+      ValueType *rwk = m_rwk.getPointer();
+      IndexType *iwk = m_iwk.getPointer();
+
+      // Estimate the initial step size ...
+      {
+         auto mask = (*hcur < this->h_min);
+         if ( any(mask) )
+         {
+            ValueType h0 = *hcur;
+            //std::cout << "Before hin: " << h0 << ", " << mask << "\n";
+            ierr = this->hin ( *tcur, &h0, y, rwk, func );
+            if (ierr != ERR_SUCCESS)
+            {
+               fprintf(stderr,"Failure solve(): %d %s\n", ierr, GetErrorString(ierr));
+               return ierr;
+            }
+            //std::cout << "After hin: " << h0 << "\n";
+
+            *hcur = select( mask, h0, *hcur );
+         }
+         //printf("hin = %s %s %e %e\n", toString(*hcur).c_str(), toString(mask).c_str(), this->h_min, this->h_max);
+      }
+
+      // Zero the counters ...
+      nst = 0;
+      //nfe = 0;
+      //nlu = 0;
+      //nje = 0;
+      iter = 0;
+
+      // Set the work arrays ...
+      ValueType *RESTRICT fy   = rwk;
+      ValueType *RESTRICT ynew = fy +   (neq);
+      ValueType *RESTRICT Jy   = ynew + (neq);
+      ValueType *RESTRICT ktmp = Jy +   (neq*neq);
+      ValueType *RESTRICT yerr = ynew;
+      //__global double *ewt  = &Jy[neq*neq];
+
+      MaskType not_done = abs(t - this->t_stop) > ValueType( this->t_round );
+      while ( any(not_done) )
+      {
+         // Compute the RHS and Jacobian matrix.
+         func (neq, t, y, fy);
+         //nfe++;
+
+         //if (jac == NULL)
+         {
+            this->fdjac ( t, h, y, fy, Jy, func );
+            //nfe += neq;
+         }
+         //else
+         //{
+         //   jac (neq, t, y, Jy, user_data);
+         //}
+
+         //nje++;
+
+         // Construct iteration matrix J' := 1/(gamma*h) - J
+         {
+            const ValueType one_hgamma = 1.0 / ( h * this->gamma[0] );
+
+            for (int j = 0; j < neq; ++j)
+            {
+               ValueType *jcol = Jy + (j*neq);
+
+               for (int i = 0; i < neq; ++i)
+                  jcol[i] = -jcol[i];
+
+               jcol[j] += one_hgamma;
+            }
+         }
+
+         // Factorization J'
+         this->ludec( neq, Jy, iwk ); // simd variant
+         //nlu++;
+
+         for (int s = 0; s < this->numStages; s++)
+         {
+            // Compute the function at this stage ...
+            if (s == 0)
+            {
+               //func (neq, y, fy.getPointer());
+            }
+            else if ( this->newFunc[s] )
+            {
+               this->dcopy (neq, y, ynew);
+
+               for (int j = 0; j < s; ++j)
+               {
+                  const double Asj = A(s,j);
+                  //if (Asj != 0.0)
+                  {
+                     //printf("Asj = %f %d %d\n", Asj, s, j);
+                     ValueType *k_j = ktmp + (j*neq);
+
+                     this->daxpy1 ( neq, Asj, k_j, ynew );
+                  }
+               }
+
+               func (neq, t, ynew, fy);
+               //nfe++;
+
+               //printf("newF=%d\n", s);
+               //for (int k = 0; k < neq; ++k)
+               //   printf("ynew[%d] = %e %e\n", k, ynew[k], fy[k]);
+            }
+
+            //printf("stage=%d\n", s);
+            //for (int k = 0; k < neq; ++k)
+            //   printf("fy[%d] = %e\n", k, fy[k]);
+
+            // Build the sub-space vector K
+            ValueType *k_s = ktmp + (s*neq);
+            this->dcopy (neq, fy, k_s);
+
+            for (int j = 0; j < s; j++)
+            {
+               //if (C(s,j) != 0.0)
+               {
+                  const ValueType hCsj = C(s,j) / h;
+                  //printf("C/h = %f %d %d\n", hCsj, s, j);
+
+                  ValueType *k_j = ktmp + (j*neq);
+                  this->daxpy (neq, hCsj, k_j, k_s);
+               }
+            }
+
+            //printf("k before=%d\n", s);
+            //for (int k = 0; k < neq; ++k)
+            //   printf("k[%d] = %e\n", k, ks[k]);
+
+            // Solve the current stage ..
+            this->lusol (neq, Jy, iwk, k_s);
+
+            //printf("k after=%d\n", s);
+            //for (int k = 0; k < neq; ++k)
+            //   printf("k[%d] = %e\n", k, ks[k]);
+         }
+
+         // Compute the error estimation of the trial solution
+         this->dzero (neq, yerr);
+
+         for (int j = 0; j < this->numStages; ++j)
+         {
+            //if (this->E[j] != 0.0)
+            {
+               ValueType *k_j = ktmp + (j*neq);
+               this->daxpy1 (neq, this->E[j], k_j, yerr);
+            }
+         }
+
+         const ValueType herr = fmax( 1.0e-20, this->wnorm (yerr, y));
+
+         // Is there error acceptable?
+         MaskType accept = ((herr <= 1.0) | (h <= this->h_min)) & not_done;
+
+         // update solution ...
+         if ( any(accept) )
+         {
+            t   = select ( accept, t + h, t   );
+            nst = select ( accept, nst+1, nst );
+
+            not_done = abs(t - this->t_stop) > this->t_round;
+
+            // Need to actually compute the new solution since it was delayed from above.
+            this->dcopy (neq, y, ynew);
+            for (int j = 0; j < this->numStages; ++j)
+            {
+               //if (this->M[j] != 0.0)
+               {
+                  ValueType *k_j = ktmp + (j*neq);
+                  this->daxpy1 (neq, this->M[j], k_j, ynew);
+               }
+            }
+
+            for (int k = 0; k < this->neq; k++)
+               y[k] = select( accept, ynew[k], y[k] );
+         }
+
+         ValueType fact = 0.9 * pow( 1.0 / herr, (1.0/ this->ELO));
+
+         // Restrict the rate of change in dt
+         fact = fmax(fact, 1.0 / this->adaption_limit);
+         fact = fmin(fact,       this->adaption_limit);
+
+#if defined(VERBOSE) && (VERBOSE > 0)
+         if (iter % VERBOSE == 0)
+         {
+            std::cout << "iter= " << iter;
+            std::cout << " accept= " << accept;
+            std::cout << " done= " << done;
+            std::cout << " t= " << t;
+            std::cout << " h= " << h;
+            std::cout << " fact= " << fact;
+            std::cout << " T= " << y[getTempIndex(neq)] << "\n";
+         }
+#endif
+
+         // Apply grow/shrink factor for next step.
+         h = select( not_done, h * fact, h);
+
+         // Limit based on the upper/lower bounds
+         h = fmin(h, this->h_max);
+         h = fmax(h, this->h_min);
+
+         // Stretch the final step if we're really close and we didn't just fail ...
+         h = select( accept & ( abs((t + h) - this->t_stop) < this->h_min), this->t_stop - t, h );
+
+         // Don't overshoot the final time ...
+         h = select( not_done & ((t + h) > this->t_stop), this->t_stop - t, h );
+
+         ++iter;
+         if ( this->max_iters && iter > this->max_iters )
+         {
+            ierr = ERR_TOO_MUCH_WORK;
+            //printf("(iter > max_iters)\n");
+            break;
+         }
+      }
+
+      return ierr;
+
+      #undef nst
+      #undef nfe
+      #undef nje
+      #undef nlu
+      #undef iter
+      #undef h
+      #undef t
+      #undef neq
+      #undef A
+      #undef C
+   }
+
+};
+
 template <typename Functor, typename RHSptr>
 void simd_rk_driver ( const int numProblems, const double *u_in, const double t_stop, const Functor& func, const RHSptr rhs_func, const ckdata_t *RESTRICT ck )
 {
@@ -1384,7 +2003,7 @@ void simd_rk_driver ( const int numProblems, const double *u_in, const double t_
          out[i*neq + k] = u[k];
 
       if (i % 1 == 0)
-         printf("%d: %d %d %d %e %e %f\n", i, _nst, _nit, _nfe, u[ getTempIndex(neq) ], T0, 1000*(t_end-t_begin));
+         printf("%d: %d %d %d %e %e %f %f\n", i, _nst, _nit, _nfe, u[ getTempIndex(neq) ], T0, (u[getTempIndex(neq)]-T0)/T0, 1000*(t_end-t_begin));
    };
 
    double time_scalar = WallClock();
@@ -1406,6 +2025,192 @@ void simd_rk_driver ( const int numProblems, const double *u_in, const double t_
    simd_cklib_functor<SimdType> simd_func( ck, p );
    //SimdERKSolverType<SimdType> simd_solver( neq );
    typedef SimdERKSolverType<SimdType> SimdSolverType;
+   SimdSolverType simd_solver( neq );
+
+   for (int i0 = 0; i0 < numProblems; i0 += VectorLength)
+   {
+      if ( i0 + VectorLength <= numProblems )
+      {
+         for (int i = 0; i < VectorLength; ++i)
+         {
+            const double *ui = u_in + neq*(i0+i);
+            for (int j = 0; j < neq; ++j)
+               u[j*VectorLength+i] = ui[j];
+         }
+
+         SimdType *v_u = (SimdType *) u.getPointer();
+
+         SimdType T0 = v_u[ getTempIndex(neq) ];
+
+         SimdType t(0), h(0);
+         typename SimdSolverType::CountersType counters;
+
+         simd_solver.init( 0.0, t_stop );
+         int ierr = simd_solver.solve ( &t, &h, &counters, v_u, simd_func );
+         if (ierr != ERR_SUCCESS)
+         {
+            fprintf(stderr,"%d: simd_solver error %d %s\n", i0, ierr, GetErrorString(ierr));
+            if (ierr == ERR_TOO_MUCH_WORK)
+               fprintf(stderr,"--: simd_solver nit= %d %s\n", counters.nit, toString(counters.nst).c_str());
+            exit(-1);
+         }
+
+         for (int i = 0; i < VectorLength; ++i)
+         {
+            double *v_out = vector_out.getPointer() + neq*(i0+i);
+            for (int j = 0; j < neq; ++j)
+               v_out[j] = u[j*VectorLength+i];
+         }
+
+         printf("i0: %d %s %d %s %s\n", i0, toString(counters.nst).c_str(), counters.nit, toString( v_u[getTempIndex(neq)] ).c_str(), toString(T0).c_str(), toString((v_u[getTempIndex(neq)]-T0)/T0).c_str());
+      }
+      else
+      {
+         rk_counters_t counters;
+         for (int i = i0; i < numProblems; ++i)
+            scalar_solver( i, vector_out, &counters );
+      }
+   }
+
+   time_vector = WallClock() - time_vector;
+
+   printf("SIMD timer: %f %f %.1f\n", 1000.*time_vector, 1000.*time_scalar, time_scalar/time_vector);
+
+   {
+      double err2 = 0, ref2 = 0;
+      double errmax = 0;
+      int ierrmax = -1;
+      for (int i = 0; i < numProblems; ++i)
+      {
+         const double *v_out = vector_out.getPointer() + neq*i;
+         const double *s_out = scalar_out.getPointer() + neq*i;
+         double diff = std::abs( s_out[ getTempIndex(neq) ]
+                               - v_out[ getTempIndex(neq) ] );
+         err2 += sqr( diff );
+         ref2 += sqr( s_out[ getTempIndex(neq) ] );
+
+         if ( diff > errmax ) {
+            errmax = diff;
+            ierrmax = i;
+         }
+      }
+
+      printf("err2= %e %e %e %d %e %d\n", err2, ref2, std::sqrt(err2)/std::sqrt(ref2), numProblems % VectorLength, errmax, ierrmax);
+   }
+   {
+      double err2 = 0, ref2 = 0;
+      double errmax = 0;
+      int ierrmax = -1;
+      for (int k = 0; k < kk; ++k)
+         for (int i = 0; i < numProblems; ++i)
+         {
+            const double *v_out = vector_out.getPointer() + neq*i;
+            const double *s_out = scalar_out.getPointer() + neq*i;
+            double diff = std::abs( s_out[ getFirstSpeciesIndex(neq)+k ]
+                                  - v_out[ getFirstSpeciesIndex(neq)+k ] );
+            err2 += sqr( diff );
+            ref2 += sqr( s_out[ getFirstSpeciesIndex(neq)+k ] );
+
+            if ( diff > errmax ) {
+               errmax = diff;
+               ierrmax = i;
+            }
+         }
+
+      printf("err2= %e %e %e %e %d\n", err2, ref2, std::sqrt(err2)/std::sqrt(ref2), errmax, ierrmax);
+   }
+
+   return;
+}
+
+template <typename Functor, typename RHSptr>
+void simd_ros_driver ( const int numProblems, const double *u_in, const double t_stop, const Functor& func, const RHSptr rhs_func, const ckdata_t *RESTRICT ck )
+{
+   const int kk = ck->n_species;
+   const int neq = kk+1;
+   const double p = func.getPressure();
+
+   typedef typename VCL_TypeSelector<double,4>::value_type SimdType;
+   typedef typename VCL_MaskSelector<SimdType>::mask_type MaskType;
+   const int VectorLength = VCL_Length<SimdType>::length;
+
+   printf("Instruction Set= %d %s %d %s\n", INSTRSET, typeid(SimdType).name(), VectorLength, typeid( MaskType).name());
+
+   VectorType<double,Alignment> scalar_out( neq * numProblems );
+   VectorType<double,Alignment> vector_out( neq * numProblems );
+
+   ros_t ros;
+
+   ros_create (&ros, neq, Ros4);
+
+   ros.max_iters = 1000;
+   ros.min_iters = 1;
+
+   int lenrwk = ros_lenrwk (&ros);
+   int leniwk = ros_leniwk (&ros);
+   VectorType<double,Alignment> rwk( VectorLength * lenrwk );
+   VectorType<int,Alignment> iwk( VectorLength * leniwk );
+   VectorType<double,Alignment> u( VectorLength * neq );
+
+   int nst = 0, nit = 0, nfe = 0, nje = 0;
+
+   auto scalar_solver = [&](const int i, VectorType<double,Alignment>& out, ros_counters_t *counters)
+   {
+      for (int k = 0; k < neq; ++k)
+         u[k] = u_in[ i*neq + k ];
+
+      const double T0 = u_in[ i*neq + getTempIndex(neq) ];
+
+      double t = 0, h = 0;
+
+      ros_init (&ros, t, t_stop);
+
+      double t_begin = WallClock();
+
+      int ierr = ros_solve (&ros, &t, &h, counters, u.getPointer(), iwk.getPointer(), rwk.getPointer(), rhs_func, /*jac_func*/NULL, (void*)&func);
+      if (ierr != ROS_SUCCESS)
+      {
+         fprintf(stderr,"%d: ros_solve error %d %d %d\n", i, ierr, counters->niters, ros.max_iters);
+         exit(-1);
+      }
+
+      double t_end = WallClock();
+
+      const int _nit = counters->niters;
+      const int _nst = counters->nst;
+      const int _nfe = counters->nfe;
+      const int _nje = counters->nje;
+
+      nit += _nit;
+      nst += _nst;
+      nfe += _nfe;
+      nje += _nje;
+
+      for (int k = 0; k < neq; ++k)
+         out[i*neq + k] = u[k];
+
+      if (i % 1 == 0)
+         printf("%d: %d %d %d %e %e %f %f\n", i, _nst, _nit, _nfe, u[ getTempIndex(neq) ], T0, (u[ getTempIndex(neq) ]-T0)/T0, 1000*(t_end-t_begin));
+   };
+
+   double time_scalar = WallClock();
+
+   for (int i = 0; i < numProblems; ++i)
+   {
+      ros_counters_t counters;
+      scalar_solver(i, scalar_out, &counters);
+      //if (i % 10 == 0)
+      //   printf("%d: %d %d %f\n", i, counters.nsteps, counters.niters, scalar_out[i*neq+getTempIndex(neq)] );
+   }
+
+   ros_destroy(&ros);
+
+   time_scalar = WallClock() - time_scalar;
+
+   double time_vector = WallClock();
+
+   simd_cklib_functor<SimdType> simd_func( ck, p );
+   typedef SimdRosSolverType<SimdType> SimdSolverType;
    SimdSolverType simd_solver( neq );
    simd_solver.max_iters=200;
 
@@ -1444,11 +2249,11 @@ void simd_rk_driver ( const int numProblems, const double *u_in, const double t_
                v_out[j] = u[j*VectorLength+i];
          }
 
-         printf("i0: %d %s %d %s %s\n", i0, toString(counters.nst).c_str(), counters.nit, toString( v_u[getTempIndex(neq)] ).c_str(), toString(T0).c_str());
+         printf("i0: %d %s %d %s %s %s\n", i0, toString(counters.nst).c_str(), counters.nit, toString( v_u[getTempIndex(neq)] ).c_str(), toString(T0).c_str(), toString((v_u[getTempIndex(neq)]-T0)/T0).c_str());
       }
       else
       {
-         rk_counters_t counters;
+         ros_counters_t counters;
          for (int i = i0; i < numProblems; ++i)
             scalar_solver( i, vector_out, &counters );
       }
@@ -1460,32 +2265,46 @@ void simd_rk_driver ( const int numProblems, const double *u_in, const double t_
 
    {
       double err2 = 0, ref2 = 0;
+      double errmax = 0;
+      int ierrmax = -1;
       for (int i = 0; i < numProblems; ++i)
       {
          const double *v_out = vector_out.getPointer() + neq*i;
          const double *s_out = scalar_out.getPointer() + neq*i;
-         double diff = s_out[ getTempIndex(neq) ]
-                     - v_out[ getTempIndex(neq) ];
+         double diff = std::abs( s_out[ getTempIndex(neq) ]
+                               - v_out[ getTempIndex(neq) ] );
          err2 += sqr( diff );
          ref2 += sqr( s_out[ getTempIndex(neq) ] );
+
+         if ( diff > errmax ) {
+            errmax = diff;
+            ierrmax = i;
+         }
       }
 
-      printf("err2= %e %e %e %d\n", err2, ref2, std::sqrt(err2)/std::sqrt(ref2), numProblems % VectorLength);
+      printf("err2= %e %e %e %d %e %d\n", err2, ref2, std::sqrt(err2)/std::sqrt(ref2), numProblems % VectorLength, errmax, ierrmax);
    }
    {
       double err2 = 0, ref2 = 0;
+      double errmax = 0;
+      int ierrmax = -1;
       for (int k = 0; k < kk; ++k)
          for (int i = 0; i < numProblems; ++i)
          {
             const double *v_out = vector_out.getPointer() + neq*i;
             const double *s_out = scalar_out.getPointer() + neq*i;
-            double diff = s_out[ getFirstSpeciesIndex(neq)+k ]
-                        - v_out[ getFirstSpeciesIndex(neq)+k ];
+            double diff = std::abs( s_out[ getFirstSpeciesIndex(neq)+k ]
+                                  - v_out[ getFirstSpeciesIndex(neq)+k ] );
             err2 += sqr( diff );
             ref2 += sqr( s_out[ getFirstSpeciesIndex(neq)+k ] );
+
+            if ( diff > errmax ) {
+               errmax = diff;
+               ierrmax = i;
+            }
          }
 
-      printf("err2= %e %e %e\n", err2, ref2, std::sqrt(err2)/std::sqrt(ref2));
+      printf("err2= %e %e %e %e %d\n", err2, ref2, std::sqrt(err2)/std::sqrt(ref2), errmax, ierrmax);
    }
 
    return;
