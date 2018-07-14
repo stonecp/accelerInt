@@ -498,8 +498,10 @@ int rk_solve (__global const rk_t *rk, double *tcur, double *hcur, __private rk_
       fact = fmax(fact, 1.0 / rk->adaption_limit);
       fact = fmin(fact,       rk->adaption_limit);
 
-      //if (iter % 100 == 0)
-      //   printf("iter = %d: passed=%d ... t = %e, fact = %f %f %e\n", iter, (accept ? (h <= rk->h_min ? -1 : 1) : 0), t, fact, y[__getIndex(neq-1)], h);
+#if defined(VERBOSE) && (VERBOSE > 0)
+      if (iter % (VERBOSE) == 0)
+         printf("iter = %d: passed=%d ... t = %e, fact = %f %f %e\n", iter, (accept ? (h <= rk->h_min ? -1 : 1) : 0), t, fact, y[__getIndex(neq-1)], h);
+#endif
 
       // Apply grow/shrink factor for next step.
       h = h * fact;

@@ -725,7 +725,7 @@ void test_simd_rhs ( const int numProblems, const double *u_in, Func& func, cons
    printf("SIMD timer: %f %f %.1f %d %e\n", 1000.*time_vector, 1000.*time_scalar, time_scalar/time_vector, sum_s == sum_v, fabs(sum_s-sum_v)/fabs(sum_s));
 
    {
-      double err2, ref2 = 0;
+      double err2 = 0, ref2 = 0;
       for (int i = 0; i < numProblems; ++i)
       {
          const double *v_out = vector_out.getPointer() + neq*i;
@@ -739,7 +739,7 @@ void test_simd_rhs ( const int numProblems, const double *u_in, Func& func, cons
       printf("err2= %e %e %e %d\n", err2, ref2, std::sqrt(err2)/std::sqrt(ref2), numProblems % VectorLength);
    }
    {
-      double err2, ref2 = 0;
+      double err2 = 0, ref2 = 0;
       for (int k = 0; k < kk; ++k)
          for (int i = 0; i < numProblems; ++i)
          {
@@ -1030,8 +1030,12 @@ struct simd_rk_solver_type : public rk_t
 
          // If y'' is still bad after a few iterations, just accept h and give up.
          if ( iter > 1 ) {
-            hnew_is_ok = (hrat > 2.0);
-            hnew = select( hnew_is_ok, hg, hnew );
+            //hnew_is_ok = (hrat > 2.0);
+            //hnew = select( hnew_is_ok, hg, hnew );
+            auto mask = (hrat > 2.0);
+            hnew = select( mask, hg, hnew );
+            //hnew_is_ok = select( mask, mask, hnew_is_ok );
+            hnew_is_ok |= mask;
          }
 
          //printf("iter=%d, yddnrw=%e, hnew=%e, hlb=%e, hub=%e\n", iter, yddnrm, hnew, hlb, hub);
@@ -1077,7 +1081,7 @@ struct simd_rk_solver_type : public rk_t
 
             *hcur = select( mask, h0, *hcur );
          }
-         printf("hin = %s %s %e %e\n", toString(*hcur).c_str(), toString(mask).c_str(), this->h_min, this->h_max);
+         //printf("hin = %s %s %e %e\n", toString(*hcur).c_str(), toString(mask).c_str(), this->h_min, this->h_max);
       }
 
       #define t (*tcur)
@@ -1120,7 +1124,7 @@ struct simd_rk_solver_type : public rk_t
          fact = max(fact, 1.0 / this->adaption_limit);
          fact = min(fact,       this->adaption_limit);
 
-#if 1
+#if defined(VERBOSE) && (VERBOSE > 0)
          if (iter % 10 == 0)
             printf("iter = %d: accept=%s, not_done=%s t=%s, fact=%s %s %s\n", iter, toString(accept).c_str(), toString(not_done).c_str(), toString(t).c_str(), toString(fact).c_str(), toString(y[neq-1]).c_str(), toString(h).c_str());
 #endif
@@ -1185,7 +1189,7 @@ void simd_rk_driver ( const int numProblems, const double *u_in, const double t_
 
    int nst = 0, nit = 0, nfe = 0;
 
-   auto scalar_solver = [&](const int i, VectorType<double,Alignment>& out)
+   auto scalar_solver = [&](const int i, VectorType<double,Alignment>& out, rk_counters_t *counters)
    {
       for (int k = 0; k < neq; ++k)
          u[k] = u_in[ i*neq + k ];
@@ -1193,23 +1197,22 @@ void simd_rk_driver ( const int numProblems, const double *u_in, const double t_
       const double T0 = u_in[ i*neq + getTempIndex(neq) ];
 
       double t = 0, h = 0;
-      rk_counters_t counters;
 
       rk_init (&rk, t, t_stop);
 
       double t_begin = WallClock();
 
-      int ierr = rk_solve (&rk, &t, &h, &counters, u.getPointer(), rwk.getPointer(), rhs_func, (void*)&func);
+      int ierr = rk_solve (&rk, &t, &h, counters, u.getPointer(), rwk.getPointer(), rhs_func, (void*)&func);
       if (ierr != RK_SUCCESS)
       {
-         fprintf(stderr,"%d: rk_solve error %d %d %d\n", i, ierr, counters.niters, rk.max_iters);
+         fprintf(stderr,"%d: rk_solve error %d %d %d\n", i, ierr, counters->niters, rk.max_iters);
          exit(-1);
       }
 
       double t_end = WallClock();
 
-      const int _nst = counters.nsteps;
-      const int _nit = counters.niters;
+      const int _nst = counters->nsteps;
+      const int _nit = counters->niters;
       const int _nfe = _nit * 6;
 
       nst += _nst;
@@ -1226,7 +1229,12 @@ void simd_rk_driver ( const int numProblems, const double *u_in, const double t_
    double time_scalar = WallClock();
 
    for (int i = 0; i < numProblems; ++i)
-      scalar_solver(i, scalar_out);
+   {
+      rk_counters_t counters;
+      scalar_solver(i, scalar_out, &counters);
+      //if (i % 10 == 0)
+      //   printf("%d: %d %d %f\n", i, counters.nsteps, counters.niters, scalar_out[i*neq+getTempIndex(neq)] );
+   }
 
    rk_destroy(&rk);
 
@@ -1251,6 +1259,8 @@ void simd_rk_driver ( const int numProblems, const double *u_in, const double t_
 
          SimdType *v_u = (SimdType *) u.getPointer();
 
+         SimdType T0 = v_u[ getTempIndex(neq) ];
+
          SimdType t(0), h(0);
          typename simd_rk_solver_type<SimdType>::Counters counters;
 
@@ -1264,12 +1274,13 @@ void simd_rk_driver ( const int numProblems, const double *u_in, const double t_
                v_out[j] = u[j*VectorLength+i];
          }
 
-         printf("i0: %d %s %s\n", i0, toString(counters.nst).c_str(), toString( v_u[getTempIndex(neq)] ).c_str());
+         printf("i0: %d %s %d %s %s\n", i0, toString(counters.nst).c_str(), counters.nit, toString( v_u[getTempIndex(neq)] ).c_str(), toString(T0).c_str());
       }
       else
       {
+         rk_counters_t counters;
          for (int i = i0; i < numProblems; ++i)
-            scalar_solver(i, vector_out );
+            scalar_solver( i, vector_out, &counters );
       }
    }
 
@@ -1278,7 +1289,7 @@ void simd_rk_driver ( const int numProblems, const double *u_in, const double t_
    printf("SIMD timer: %f %f %.1f\n", 1000.*time_vector, 1000.*time_scalar, time_scalar/time_vector);
 
    {
-      double err2, ref2 = 0;
+      double err2 = 0, ref2 = 0;
       for (int i = 0; i < numProblems; ++i)
       {
          const double *v_out = vector_out.getPointer() + neq*i;
@@ -1292,7 +1303,7 @@ void simd_rk_driver ( const int numProblems, const double *u_in, const double t_
       printf("err2= %e %e %e %d\n", err2, ref2, std::sqrt(err2)/std::sqrt(ref2), numProblems % VectorLength);
    }
    {
-      double err2, ref2 = 0;
+      double err2 = 0, ref2 = 0;
       for (int k = 0; k < kk; ++k)
          for (int i = 0; i < numProblems; ++i)
          {
