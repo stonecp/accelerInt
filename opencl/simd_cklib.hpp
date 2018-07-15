@@ -2587,7 +2587,7 @@ void simd_rk_driver ( const int numProblems, const double *u_in, const double t_
       for (int k = 0; k < neq; ++k)
          out[i*neq + k] = u[k];
 
-      if (i % 1 == 0)
+      if (i % VectorLength == 0)
          printf("%d: %d %d %d %e %e %f %f\n", i, _nst, _nit, _nfe, u[ getTempIndex(neq) ], T0, (u[getTempIndex(neq)]-T0)/T0, 1000*(t_end-t_begin));
    };
 
@@ -2774,7 +2774,7 @@ void simd_ros_driver ( const int numProblems, const double *u_in, const double t
       for (int k = 0; k < neq; ++k)
          out[i*neq + k] = u[k];
 
-      if (i % 1 == 0)
+      if (i % VectorLength == 0)
          printf("%d: %d %d %d %e %e %f %f\n", i, _nst, _nit, _nfe, u[ getTempIndex(neq) ], T0, (u[ getTempIndex(neq) ]-T0)/T0, 1000*(t_end-t_begin));
    };
 
@@ -2792,12 +2792,16 @@ void simd_ros_driver ( const int numProblems, const double *u_in, const double t
 
    time_scalar = WallClock() - time_scalar;
 
-   double time_vector = WallClock();
+   printf("Scalar: %f %d %d %d %d\n", 1000*time_scalar, nst, nit, nfe, nje);
 
    simd_cklib_functor<SimdType> simd_func( ck, p );
    typedef SimdRosSolverType<SimdType> SimdSolverType;
    SimdSolverType simd_solver( neq );
    //simd_solver.max_iters=200;
+
+   nst = nit = nfe = nje = 0;
+
+   double time_vector = WallClock();
 
    for (int i0 = 0; i0 < numProblems; i0 += VectorLength)
    {
@@ -2834,6 +2838,14 @@ void simd_ros_driver ( const int numProblems, const double *u_in, const double t
                v_out[j] = u[j*VectorLength+i];
          }
 
+         nit += counters.nit * VectorLength;
+         for (int i = 0; i < VectorLength; ++i)
+         {
+            nst += counters.nst[i];
+            nfe += counters.nfe[i];
+            nje += counters.nje[i];
+         }
+
          std::cout << i0 << ": final " << counters.nst
                          << " " << counters.nit
                          << " " << counters.nfe
@@ -2843,13 +2855,23 @@ void simd_ros_driver ( const int numProblems, const double *u_in, const double t
       }
       else
       {
-         ros_counters_t counters;
          for (int i = i0; i < numProblems; ++i)
+         {
+            ros_counters_t counters;
+
             scalar_solver( i, vector_out, &counters );
+
+            nit += counters.niters;
+            nst += counters.nst;
+            nfe += counters.nfe;
+            nje += counters.nje;
+         }
       }
    }
 
    time_vector = WallClock() - time_vector;
+
+   printf("SIMD: %f %d %d %d %d\n", 1000*time_vector, nst, nit, nfe, nje);
 
    printf("SIMD timer: %f %f %.1f\n", 1000.*time_vector, 1000.*time_scalar, time_scalar/time_vector);
 
@@ -2970,7 +2992,7 @@ void simd_sdirk_driver ( const int numProblems, const double *u_in, const double
       for (int k = 0; k < neq; ++k)
          out[i*neq + k] = u[k];
 
-      if (i % 1 == 0)
+      if (i % VectorLength == 0)
          printf("%d: final %d %d %d %d %d %e %e %f %f\n", i, _nst, _nit, _nfe, _nlu, _nni, u[ getTempIndex(neq) ], T0, (u[ getTempIndex(neq) ]-T0)/T0, 1000*(t_end-t_begin));
    };
 
@@ -2988,12 +3010,16 @@ void simd_sdirk_driver ( const int numProblems, const double *u_in, const double
 
    time_scalar = WallClock() - time_scalar;
 
-   double time_vector = WallClock();
+   printf("Scalar: %f %d %d %d %d %d %d\n", 1000*time_scalar, nst, nit, nfe, nje, nlu, nni);
 
    simd_cklib_functor<SimdType> simd_func( ck, p );
    typedef SimdSdirkSolverType<SimdType> SimdSolverType;
    SimdSolverType simd_solver( neq );
    simd_solver.max_iters=1000;
+
+   nst = nit = nfe = nlu = nje = nni = 0;
+
+   double time_vector = WallClock();
 
    for (int i0 = 0; i0 < numProblems; i0 += VectorLength)
    {
@@ -3030,7 +3056,16 @@ void simd_sdirk_driver ( const int numProblems, const double *u_in, const double
                v_out[j] = u[j*VectorLength+i];
          }
 
-         //printf("%d: final %s %d %s %s %s\n", i0, toString(counters.nst).c_str(), counters.nit, toString( v_u[getTempIndex(neq)] ).c_str(), toString(T0).c_str(), toString((v_u[getTempIndex(neq)]-T0)/T0).c_str());
+         nit += counters.nit * VectorLength;
+         for (int i = 0; i < VectorLength; ++i)
+         {
+            nst += counters.nst[i];
+            nfe += counters.nfe[i];
+            nje += counters.nje[i];
+            nlu += counters.nlu[i];
+            nni += counters.nni[i];
+         }
+
          std::cout << i0 << ": final " << counters.nst
                          << " " << counters.nit
                          << " " << counters.nfe
@@ -3042,15 +3077,27 @@ void simd_sdirk_driver ( const int numProblems, const double *u_in, const double
       }
       else
       {
-         sdirk_counters_t counters;
          for (int i = i0; i < numProblems; ++i)
+         {
+            sdirk_counters_t counters;
+
             scalar_solver( i, vector_out, &counters );
+
+            nit += counters.niters;
+            nst += counters.nst;
+            nfe += counters.nfe;
+            nje += counters.nje;
+            nlu += counters.nlu;
+            nni += counters.nni;
+         }
       }
    }
 
    time_vector = WallClock() - time_vector;
 
-   printf("SIMD timer: %f %f %.1f\n", 1000.*time_vector, 1000.*time_scalar, time_scalar/time_vector);
+   printf("SIMD: %f %d %d %d %d %d %d\n", 1000*time_vector, nst, nit, nfe, nje, nlu, nni);
+
+   printf("SIMD speed-up: %f %f %.1f\n", 1000.*time_vector, 1000.*time_scalar, time_scalar/time_vector);
 
    {
       double err2 = 0, ref2 = 0;
