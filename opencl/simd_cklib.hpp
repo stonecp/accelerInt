@@ -1759,7 +1759,7 @@ struct SimdRosSolverType : public CommonSolverType<_ValueType>
 
       // Zero the counters ...
       nst = 0;
-      //nfe = 0;
+      nfe = 0;
       //nlu = 0;
       //nje = 0;
       iter = 0;
@@ -1777,12 +1777,12 @@ struct SimdRosSolverType : public CommonSolverType<_ValueType>
       {
          // Compute the RHS and Jacobian matrix.
          func (neq, t, y, fy);
-         //nfe++;
+         nfe++;
 
          //if (jac == NULL)
          {
             this->fdjac ( t, h, y, fy, Jy, func );
-            //nfe += neq;
+            nfe += neq;
          }
          //else
          //{
@@ -1834,7 +1834,7 @@ struct SimdRosSolverType : public CommonSolverType<_ValueType>
                }
 
                func (neq, t, ynew, fy);
-               //nfe++;
+               nfe++;
 
                //printf("newF=%d\n", s);
                //for (int k = 0; k < neq; ++k)
@@ -1924,7 +1924,7 @@ struct SimdRosSolverType : public CommonSolverType<_ValueType>
          {
             std::cout << "iter= " << iter;
             std::cout << " accept= " << accept;
-            std::cout << " done= " << done;
+            std::cout << " done= " << not_done;
             std::cout << " t= " << t;
             std::cout << " h= " << h;
             std::cout << " fact= " << fact;
@@ -2011,6 +2011,8 @@ struct SimdSdirkSolverType : public CommonSolverType<_ValueType>
       : Parent(_neq),
         solverTag( _tag)
    {
+      this->adaption_limit = 5.0; // This is higher than the default to match sdirk.c!!!
+
       if (solverTag == S4a)
          this->set_S4a();
       else
@@ -2213,6 +2215,8 @@ struct SimdSdirkSolverType : public CommonSolverType<_ValueType>
       MaskType not_done = abs(t - this->t_stop) > ValueType( this->t_round );
       while ( any(not_done) )
       {
+         //std::cout << "Step: " << iter << nst << " " << ComputeM << " " << ComputeJ << not_done << t << "\n";
+
          // Construct the Iteration matrix ... if needed.
          if (ComputeM)
          {
@@ -2228,13 +2232,15 @@ struct SimdSdirkSolverType : public CommonSolverType<_ValueType>
                      func (neq, t, y, fy);
                   //else
                   //   cklib_callback (neq, t, y, fy, user_data);
-                  nfe++;
+                  //nfe++;
 
                   this->fdjac ( t, h, y, fy, Jy, func );
-                  nfe += neq;
+                  //nfe += neq;
+                  nfe = select( not_done, nfe + (neq+1), nfe );
                }
 
-               nje++;
+               //nje++;
+               nje = select( not_done, nje+1, nje );
             }
 
             // Compute M := 1/(gamma*h) - J
@@ -2252,13 +2258,15 @@ struct SimdSdirkSolverType : public CommonSolverType<_ValueType>
 
             // Factorization M
             this->ludec( neq, M, iwk );
-            nlu++;
+            //nlu++;
+            nlu = select(not_done, nlu+1, nlu);
          }
 
          const BaseIndexType Status_None      = 0,
                              Status_Converged = 1,
-                             Status_Diverged  = 2;
-         IndexType Status(Status_None);
+                             Status_Diverged  = 2,
+                             Status_Finished  = 3;
+         IndexType Status = select( not_done, IndexType(Status_None), IndexType(Status_Finished) );
 
          MaskType  Accepted; // All are intialized inside of stage loop.
          ValueType HScalingFactor;
@@ -2287,20 +2295,25 @@ struct SimdSdirkSolverType : public CommonSolverType<_ValueType>
             }
 
             // Solve the non-linear problem with the Newton-Raphson method.
-            Status = Status_None;
+            Status = select( not_done, IndexType(Status_None), IndexType(Status_Finished) );
             Accepted = false;
             HScalingFactor = 0.8;
             NewtonTheta = NewtonThetaMin;
             ValueType NewtonResidual;
 
-            for (int NewtonIter = 0; NewtonIter < MaxNewtonIterations; NewtonIter++, nni++)
+            //for (int NewtonIter = 0; NewtonIter < MaxNewtonIterations; NewtonIter++, nni++)
+            for (int NewtonIter = 0; NewtonIter < MaxNewtonIterations; NewtonIter++)
             {
+               //nni++;
+               nni = select( (Status == Status_None), nni+1, nni );
+
                // 1) Build the RHS of the root equation: F := G + (h*gamma)*f(y+Z_s) - Z_s
                for (int k = 0; k < neq; ++k)
                   del[(k)] = y[(k)] + z_s[(k)];
 
                func (neq, t, del, fy);
-               nfe++;
+               //nfe++;
+               nfe = select( (Status == Status_None), nfe+1, nfe );
 
                const ValueType hgamma = h * this->gamma;
                for (int k = 0; k < neq; ++k)
@@ -2315,25 +2328,25 @@ struct SimdSdirkSolverType : public CommonSolverType<_ValueType>
                // 3.1) Compute the norm of the correction.
                const ValueType dnorm = this->wnorm ( del, y);
 
-               std::cout << "miter: " << iter <<" " << s << " "<< NewtonIter << dnorm << "\n";
+               //std::cout << "miter: " << iter <<" " << s << " "<< NewtonIter << dnorm << NewtonResidual << Status << "\n";
 
                // 3.2) If not the first iteration, estimate the rate.
                if (NewtonIter != 0)
                {
                   NewtonTheta = dnorm / NewtonResidual; // How much as the residual changed from last iteration.
 
-                  MaskType isDiverging = (NewtonTheta >= NewtonThetaMax);
+                  MaskType isDiverging = (NewtonTheta >= NewtonThetaMax) && not_done;
 
                   ValueType ConvergenceRate = NewtonTheta / (1.0 - NewtonTheta); // Possible FLTEXP here.
 
-                  std::cout << "miter= " << NewtonIter << dnorm << ConvergenceRate << isDiverging << "\n";
+                  //std::cout << " " << ConvergenceRate << isDiverging << NewtonTheta << "\n";
 
                   // If one is diverging, may just give up early all around.
                   // Use the status flag to change or hold h.
                   if ( any( isDiverging ) )
                   {
                      Status = select( isDiverging, Status_Diverged, Status );
-                     std::cout << "any NewtonTheta >= NewtonThetaMax " << h << NewtonTheta << isDiverging << "\n";
+                     //std::cout << "any(NewtonTheta >= NewtonThetaMax) " << isDiverging << "\n";
                      break;
                   }
 
@@ -2344,7 +2357,7 @@ struct SimdSdirkSolverType : public CommonSolverType<_ValueType>
                   ValueType PredictedError = dnorm * pow( NewtonTheta,
                                        (MaxNewtonIterations-NewtonIter)/(1.0-NewtonTheta));
 
-                  MaskType PredictedErrorTooLarge = ( PredictedError > NewtonTolerance );
+                  MaskType PredictedErrorTooLarge = ( PredictedError > NewtonTolerance ) && not_done;
                   if ( any( PredictedErrorTooLarge ) )
                   {
                      // Doubtful we'll converge, shrink h and try again.
@@ -2352,17 +2365,17 @@ struct SimdSdirkSolverType : public CommonSolverType<_ValueType>
                      HScalingFactor = select( PredictedErrorTooLarge,
                                               0.9 * pow( QNewton, -1.0 / (1.0 + MaxNewtonIterations - NewtonIter)),
                                               1.0 );
-                     std::cout << "PredictedError > NewtonTolerance " << h << HScalingFactor << PredictedErrorTooLarge << nst << s << NewtonIter << "\n";
+                     //std::cout << "PredictedError > NewtonTolerance " << HScalingFactor << PredictedError << PredictedErrorTooLarge << "\n";
                      break;
                   }
 
                   // So, nobody is diverging and none are predicted to fail. Test for new convergence.
-                  Accepted = (ConvergenceRate * dnorm < NewtonTolerance);
-                  std::cout << "Accepted: " << NewtonIter << Accepted << Status << "\n";
+                  Accepted = (ConvergenceRate * dnorm < NewtonTolerance) || not(not_done);
+                  //std::cout << "Accepted: " << Accepted << Status << "\n";
                }
 
                // Save the residual norm for the next iteration unless I'm already converged.
-               MaskType UpdateSolution = (Status == Status_None);
+               MaskType UpdateSolution = MaskType(Status == Status_None) && not_done;
                NewtonResidual = select( UpdateSolution, dnorm, NewtonResidual );
 
                // 4) Update the solution if newly accepted: Z_s <- Z_s + delta
@@ -2371,13 +2384,13 @@ struct SimdSdirkSolverType : public CommonSolverType<_ValueType>
 
                // Finally, test if everyone's finally finished.
                Status = select( Accepted, Status_Converged, Status );
-               if ( all( Accepted ) )
+               if ( all( Accepted || MaskType(Status == Status_Finished) ) )
                   break;
             }
 
             if ( any(!Accepted) )
             {
-               //printf("failed to converge %d %d.\n", iter, s);
+               //printf("Any(!Accepted) %d %d.\n", iter, s);
                ComputeJ = 0; // Jacobian is still valid
                ComputeM = 1; // M is invalid since h will change (perhaps) drastically.
                break;
@@ -2386,7 +2399,7 @@ struct SimdSdirkSolverType : public CommonSolverType<_ValueType>
 
          } // ... stages
 
-         if ( all( Accepted ) )
+         if ( all( Accepted || MaskType(Status == Status_Finished) ) )
          {
             // Compute the error estimation of the trial solution.
             this->dzero (neq, yerr);
@@ -2400,7 +2413,7 @@ struct SimdSdirkSolverType : public CommonSolverType<_ValueType>
             ValueType herr = fmax(1.0e-20, this->wnorm ( yerr, y));
 
             // Is the error acceptable?
-            Accepted = (herr <= 1.0) || (h <= this->h_min);
+            Accepted = ((herr <= 1.0) || (h <= this->h_min)) && not_done;
             if ( any( Accepted ) )
             {
                // If stiffly-accurate, Z_s with s := numStages, is the solution.
@@ -2420,21 +2433,28 @@ struct SimdSdirkSolverType : public CommonSolverType<_ValueType>
                nst = select( Accepted, nst+1, nst );
             }
 
-            HScalingFactor = 0.9 * pow( 1.0 / herr, (1.0 / this->ELO));
+            not_done = abs(t - this->t_stop) > ValueType( this->t_round );
+
+            HScalingFactor = select( not_done, 0.9 * pow( 1.0 / herr, (1.0 / this->ELO)), ValueType(1) );
 
             // Reuse the Jacobian if the Newton Solver is converging fast enough
             // ... for everyone. (any-all)
-            ComputeJ = any( NewtonTheta > NewtonThetaMin );
+            ComputeJ = any( NewtonTheta > NewtonThetaMin && not_done );
 
             // Don't refine if it's not a big step and we could reuse the M matrix.
-            bool recycle_M = not(ComputeJ) and all( HScalingFactor >= Qmin & HScalingFactor <= Qmax );
+            bool recycle_M = not(ComputeJ) and all( HScalingFactor >= Qmin && HScalingFactor <= Qmax );
             if (recycle_M)
             {
+               //std::cout << "Recycling M: " << "\n";
                ComputeM = 0;
                HScalingFactor = 1.0;
             }
             else
+            {
+               //if ( not(ComputeJ) and any( HScalingFactor >= Qmin && HScalingFactor <= Qmax ) )
+               //   std::cout << "Not recycling M due to any-all vote: " << HScalingFactor << any( HScalingFactor >= Qmin & HScalingFactor <= Qmax ) << "\n";
                ComputeM = 1;
+            }
          }
 
          // Restrict the rate of change in dt
@@ -2777,7 +2797,7 @@ void simd_ros_driver ( const int numProblems, const double *u_in, const double t
    simd_cklib_functor<SimdType> simd_func( ck, p );
    typedef SimdRosSolverType<SimdType> SimdSolverType;
    SimdSolverType simd_solver( neq );
-   simd_solver.max_iters=200;
+   //simd_solver.max_iters=200;
 
    for (int i0 = 0; i0 < numProblems; i0 += VectorLength)
    {
@@ -2814,7 +2834,12 @@ void simd_ros_driver ( const int numProblems, const double *u_in, const double t
                v_out[j] = u[j*VectorLength+i];
          }
 
-         printf("i0: %d %s %d %s %s %s\n", i0, toString(counters.nst).c_str(), counters.nit, toString( v_u[getTempIndex(neq)] ).c_str(), toString(T0).c_str(), toString((v_u[getTempIndex(neq)]-T0)/T0).c_str());
+         std::cout << i0 << ": final " << counters.nst
+                         << " " << counters.nit
+                         << " " << counters.nfe
+                         << " " << v_u[getTempIndex(neq)]
+                         << " " << T0
+                         << " " << ((v_u[getTempIndex(neq)]-T0)/T0) << "\n";
       }
       else
       {
@@ -2946,7 +2971,7 @@ void simd_sdirk_driver ( const int numProblems, const double *u_in, const double
          out[i*neq + k] = u[k];
 
       if (i % 1 == 0)
-         printf("%d: %d %d %d %d %d %e %e %f %f\n", i, _nst, _nit, _nfe, _nlu, _nni, u[ getTempIndex(neq) ], T0, (u[ getTempIndex(neq) ]-T0)/T0, 1000*(t_end-t_begin));
+         printf("%d: final %d %d %d %d %d %e %e %f %f\n", i, _nst, _nit, _nfe, _nlu, _nni, u[ getTempIndex(neq) ], T0, (u[ getTempIndex(neq) ]-T0)/T0, 1000*(t_end-t_begin));
    };
 
    double time_scalar = WallClock();
@@ -2968,7 +2993,7 @@ void simd_sdirk_driver ( const int numProblems, const double *u_in, const double
    simd_cklib_functor<SimdType> simd_func( ck, p );
    typedef SimdSdirkSolverType<SimdType> SimdSolverType;
    SimdSolverType simd_solver( neq );
-   simd_solver.max_iters=100;
+   simd_solver.max_iters=1000;
 
    for (int i0 = 0; i0 < numProblems; i0 += VectorLength)
    {
@@ -3005,7 +3030,15 @@ void simd_sdirk_driver ( const int numProblems, const double *u_in, const double
                v_out[j] = u[j*VectorLength+i];
          }
 
-         printf("i0: %d %s %d %s %s %s\n", i0, toString(counters.nst).c_str(), counters.nit, toString( v_u[getTempIndex(neq)] ).c_str(), toString(T0).c_str(), toString((v_u[getTempIndex(neq)]-T0)/T0).c_str());
+         //printf("%d: final %s %d %s %s %s\n", i0, toString(counters.nst).c_str(), counters.nit, toString( v_u[getTempIndex(neq)] ).c_str(), toString(T0).c_str(), toString((v_u[getTempIndex(neq)]-T0)/T0).c_str());
+         std::cout << i0 << ": final " << counters.nst
+                         << " " << counters.nit
+                         << " " << counters.nfe
+                         << " " << counters.nlu
+                         << " " << counters.nni
+                         << " " << v_u[getTempIndex(neq)]
+                         << " " << T0
+                         << " " << ((v_u[getTempIndex(neq)]-T0)/T0) << "\n";
       }
       else
       {

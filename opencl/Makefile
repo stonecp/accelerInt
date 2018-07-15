@@ -41,7 +41,7 @@ CFLAGS  = -I. -g #-std=c99
 
 ifneq ($(verbose),)
  ifneq ($(verbose),0)
-   CFLAGS += -DVERBOSE=10
+   CFLAGS += -DVERBOSE=$(verbose)
  endif
 endif
 

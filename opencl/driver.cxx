@@ -489,6 +489,18 @@ int main (int argc, char* argv[])
 #ifdef ENABLE_SIMD
    {
       SIMD::test_simd_rhs( numProblems, &u_in[0], cklib_func, ckptr );
+      if (solverTag == RK) {
+         SIMD::simd_rk_driver( numProblems, &u_in[0], t_stop, cklib_func, rhs_func, ckptr );
+         return 1;
+      }
+      else if (solverTag == ROS) {
+         SIMD::simd_ros_driver( numProblems, &u_in[0], t_stop, cklib_func, rhs_func, ckptr );
+         return 1;
+      }
+      else if (solverTag == SDIRK) {
+         SIMD::simd_sdirk_driver( numProblems, &u_in[0], t_stop, cklib_func, rhs_func, ckptr );
+         return 1;
+      }
    }
 #endif
 
