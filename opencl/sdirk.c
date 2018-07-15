@@ -864,15 +864,17 @@ int sdirk_solve (__global const sdirk_t *sdirk, double *tcur, double *hcur, __pr
             // 3) Check the convergence and convergence rate
             // 3.1) Compute the norm of the correction.
             double dnorm = sdirk_wnorm (sdirk, del, y);
+            //printf("miter: %d %d %d norm: %e\n", iter, s, NewtonIter, dnorm);
+
             // 3.2) If not the first iteration, estimate the rate.
-            if (NewtonIter > 1)
+            if (NewtonIter != 0)
             {
                NewtonTheta = dnorm / NewtonResidual;
                if (NewtonTheta < NewtonThetaMax)
                {
                   double ConvergenceRate = NewtonTheta / (1.0 - NewtonTheta);
                   Accepted = (ConvergenceRate * dnorm < NewtonTolerance);
-                  //printf("miter=%d, norm=%e, rate=%f\n", NewtonIter, dnorm, ConvergenceRate);
+                  //printf("miter=%d, norm=%e, rate=%f %d\n", NewtonIter, dnorm, ConvergenceRate, Accepted);
 
                   // Predict the error after the maximum # of iterations.
                   double PredictedError = dnorm * pow(NewtonTheta, (MaxNewtonIterations-NewtonIter)/(1.0-NewtonTheta));
@@ -881,7 +883,7 @@ int sdirk_solve (__global const sdirk_t *sdirk, double *tcur, double *hcur, __pr
                      // Error is probably too large, shrink h and try again.
                      double QNewton = fmin(10.0, PredictedError / NewtonTolerance);
                      HScalingFactor = 0.9 * pow( QNewton, -1.0 / (1.0 + MaxNewtonIterations - NewtonIter));
-                     fprintf(stderr,"PredictedError > NewtonTolerance %e %f %f %d %d %d %d\n", h, HScalingFactor, PredictedError, nst, iter, s, NewtonIter);
+                     //fprintf(stderr,"PredictedError > NewtonTolerance %e %f %f %d %d %d %d\n", h, HScalingFactor, PredictedError, nst, iter, s, NewtonIter);
                      break;
                   }
                }

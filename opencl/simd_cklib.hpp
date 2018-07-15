@@ -151,17 +151,11 @@ template <typename ValueType>
 inline ValueType fmax( const double a, const ValueType& b ) { return fmax(b,a); }
 
 template <typename ValueType>
-inline ValueType fmin( const ValueType& a, const ValueType& b )
-{
-   auto mask = a < b;
-   return select( mask, a, b );
-}
+inline ValueType fmin( const ValueType& a, const ValueType& b ) { return select( a < b, a, b ); }
 template <typename ValueType>
-inline ValueType fmin( const ValueType& a, const double b )
-{
-   auto mask = a < ValueType(b);
-   return select( mask, a, b );
-}
+inline ValueType fmin( const ValueType& a, const double b ) { return select( a < ValueType(b), a, b ); }
+template <typename ValueType>
+inline ValueType fmin( const double a, const ValueType& b ) { return fmin(b,a); }
 
 template <typename ValueType>
 inline ValueType compute_H_RT (const int k,
@@ -859,7 +853,18 @@ struct CommonSolverType
       IndexType nfe;
       IndexType nje;
       IndexType nlu;
+      IndexType nni;
       IndexType errflag;
+
+      CountersType(void)
+         : nit(0),
+           nst(0),
+           nfe(0),
+           nje(0),
+           nlu(0),
+           nni(0),
+           errflag(ERR_SUCCESS)
+      {}
    };
 
    int neq;
@@ -1115,6 +1120,25 @@ public:
       for (int k = 0; k < len; ++k)
          dst[k] = if_then_else (mask, src[k], dst[k]);
    }*/
+
+   inline void dscal (const int len, const double alpha, ValueType *RESTRICT y ) const
+   {
+      // Alpha is scalar type ... and can be easily checked.
+      if (alpha == 1.0)
+         return;
+      else
+      {
+         #pragma ivdep
+         for (int k = 0; k < len; ++k)
+            y[(k)] *= alpha;
+      }
+   }
+   inline void dscal (const int len, const ValueType& alpha, ValueType *RESTRICT y ) const
+   {
+      #pragma ivdep
+      for (int k = 0; k < len; ++k)
+         y[(k)] *= alpha;
+   }
 
    inline void daxpy1 ( const int len, const double alpha, const ValueType *RESTRICT x, ValueType *RESTRICT y )
    {
@@ -1939,12 +1963,547 @@ struct SimdRosSolverType : public CommonSolverType<_ValueType>
       #undef iter
       #undef h
       #undef t
-      #undef neq
       #undef A
       #undef C
    }
 
 };
+
+#define __matrix_index(_i,_j,_var) (this-> _var [(_i)][(_j)])
+#define A_(_i,_j)     ( __matrix_index(_i,_j,A) )
+#define Theta_(_i,_j) ( __matrix_index(_i,_j,Theta) )
+#define Alpha_(_i,_j) ( __matrix_index(_i,_j,Alpha) )
+
+template <typename _ValueType >
+struct SimdSdirkSolverType : public CommonSolverType<_ValueType>
+{
+   enum { _maxStages = 5 };
+
+   typedef CommonSolverType<_ValueType> Parent;
+
+   enum { vlen = Parent::vlen };
+
+   typedef typename Parent::ValueType     ValueType;
+   typedef typename Parent::MaskType      MaskType;
+   typedef typename Parent::CountersType  CountersType;
+   typedef typename Parent::IndexType     IndexType;
+   typedef typename Parent::BaseIndexType BaseIndexType;
+
+   typedef sdirk_solverTags solverTags;
+
+   VectorType<ValueType> m_rwk;
+   VectorType<IndexType> m_iwk;
+
+   solverTags solverTag;
+   int numStages;
+   int ELO;
+   double A[_maxStages][_maxStages];
+   double B[_maxStages];
+   double Bhat[_maxStages];
+   double C[_maxStages];
+   double D[_maxStages];
+   double E[_maxStages];
+   double Theta[_maxStages][_maxStages];
+   double Alpha[_maxStages][_maxStages];
+   double gamma;
+
+   SimdSdirkSolverType( const int _neq, const solverTags _tag = S4a )
+      : Parent(_neq),
+        solverTag( _tag)
+   {
+      if (solverTag == S4a)
+         this->set_S4a();
+      else
+      {
+         fprintf(stderr,"Invalid Sdirk solverTag = %d\n", solverTag);
+         exit(1);
+      }
+
+      // lenrwk function uses subspace lengths.
+      m_rwk.resize( this->get_lenrwk() );
+      m_iwk.resize( this->get_leniwk() );
+   }
+
+   constexpr size_t get_lenrwk(const int _neq) const
+   {
+      int lenrwk = 0;
+      lenrwk +=  _neq;			 // fy
+      lenrwk +=  _neq;			 // del & yerr
+      lenrwk += (_neq * _neq);		 // Jy
+      lenrwk += (_neq * _neq);		 // M
+      lenrwk += (_neq * this->numStages);// z
+      lenrwk +=  _neq;			 // g
+
+      return lenrwk;
+   }
+
+   constexpr size_t get_leniwk(const int _neq) const
+   {
+      return (_neq); // ipiv
+   }
+
+   constexpr size_t get_lenrwk(void) const { return this->get_lenrwk(this->neq); }
+   constexpr size_t get_leniwk(void) const { return this->get_leniwk(this->neq); }
+
+   // 4th/3rd-order L-stable SDIRK method with 5 stages.
+   // -- E. Hairer and G. Wanner, "Solving ordinary differential equations II:
+   //    stiff and differential-algebraic problems," Springer series in
+   //    computational mathematics, Springer-Verlag (1990).
+   void set_S4a (void)
+   {
+      this->solverTag = S4a;
+      this->numStages = 5;
+      this->ELO = 4;
+
+      // Constant diagonal
+      this->gamma = 8.0 / 30.0; //0.2666666666666666666666666666666667;
+
+      // A and C are lower-triangular matrices in column-major order!!!!
+      // -- A(i,j) = [(i)*(i+1)/2 + j] ... A(1,0) = A[0], A(2,0) = A[1]
+      for (int i = 0; i < _maxStages; ++i)
+         for (int j = 0; j < _maxStages; ++j)
+            A_(i,j) = 0.0;
+      A_(0,0) = this->gamma;
+      A_(1,0) = 0.5;
+      A_(1,1) = this->gamma;
+      A_(2,0) = 0.3541539528432732316227461858529820;
+      A_(2,1) =-0.05415395284327323162274618585298197;
+      A_(2,2) = this->gamma;
+      A_(3,0) = 0.08515494131138652076337791881433756;
+      A_(3,1) =-0.06484332287891555171683963466229754;
+      A_(3,2) = 0.07915325296404206392428857585141242;
+      A_(3,3) = this->gamma;
+      A_(4,0) = 2.100115700566932777970612055999074;
+      A_(4,1) =-0.7677800284445976813343102185062276;
+      A_(4,2) = 2.399816361080026398094746205273880;
+      A_(4,3) =-2.998818699869028161397714709433394;
+      A_(4,4) = this->gamma;
+
+      this->B[0]    = 2.100115700566932777970612055999074;
+      this->B[1]    =-0.7677800284445976813343102185062276;
+      this->B[2]    = 2.399816361080026398094746205273880;
+      this->B[3]    =-2.998818699869028161397714709433394;
+      this->B[4]    = this->gamma;
+
+      this->Bhat[0] = 2.885264204387193942183851612883390;
+      this->Bhat[1] =-0.1458793482962771337341223443218041;
+      this->Bhat[2] = 2.390008682465139866479830743628554;
+      this->Bhat[3] =-4.129393538556056674929560012190140;
+      this->Bhat[4] = 0.;
+
+      this->C[0]    = 8.0  / 30.0; //0.2666666666666666666666666666666667;
+      this->C[1]    = 23.0 / 30.0; // 0.7666666666666666666666666666666667;
+      this->C[2]    = 17.0 / 30.0; // 0.5666666666666666666666666666666667;
+      this->C[3]    = 0.3661315380631796996374935266701191;
+      this->C[4]    = 1.;
+
+      // Ynew = Yold + h*Sum_i {rkB_i*k_i} = Yold + Sum_i {rkD_i*Z_i}
+      this->D[0] = 0.;
+      this->D[1] = 0.;
+      this->D[2] = 0.;
+      this->D[3] = 0.;
+      this->D[4] = 1.;
+
+      // Err = h * Sum_i {(rkB_i-rkBhat_i)*k_i} = Sum_i {rkE_i*Z_i}
+      this->E[0] =-0.6804000050475287124787034884002302;
+      this->E[1] = 1.558961944525217193393931795738823;
+      this->E[2] =-13.55893003128907927748632408763868;
+      this->E[3] = 15.48522576958521253098585004571302;
+      this->E[4] = 1.;
+
+      // h*Sum_j {rkA_ij*k_j} = Sum_j {rkTheta_ij*Z_j}
+      for (int i = 0; i < _maxStages; ++i)
+         for (int j = 0; j < _maxStages; ++j)
+            Theta_(i,j) = 0.0;
+      Theta_(1,0) = 1.875;
+      Theta_(2,0) = 1.708847304091539528432732316227462;
+      Theta_(2,1) =-0.2030773231622746185852981969486824;
+      Theta_(3,0) = 0.2680325578937783958847157206823118;
+      Theta_(3,1) =-0.1828840955527181631794050728644549;
+      Theta_(3,2) = 0.2968246986151577397160821594427966;
+      Theta_(4,0) = 0.9096171815241460655379433581446771;
+      Theta_(4,1) =-3.108254967778352416114774430509465;
+      Theta_(4,2) = 12.33727431701306195581826123274001;
+      Theta_(4,3) =-11.24557012450885560524143016037523;
+
+      // Starting value for Newton iterations: Z_i^0 = Sum_j {rkAlpha_ij*Z_j}
+      for (int i = 0; i < _maxStages; ++i)
+         for (int j = 0; j < _maxStages; ++j)
+            Alpha_(i,j) = 0.0;
+      Alpha_(1,0) = 2.875000000000000000000000000000000;
+      Alpha_(2,0) = 0.8500000000000000000000000000000000;
+      Alpha_(2,1) = 0.4434782608695652173913043478260870;
+      Alpha_(3,0) = 0.7352046091658870564637910527807370;
+      Alpha_(3,1) =-0.09525565003057343527941920657462074;
+      Alpha_(3,2) = 0.4290111305453813852259481840631738;
+      Alpha_(4,0) =-16.10898993405067684831655675112808;
+      Alpha_(4,1) = 6.559571569643355712998131800797873;
+      Alpha_(4,2) =-15.90772144271326504260996815012482;
+      Alpha_(4,3) = 25.34908987169226073668861694892683;
+   }
+
+   // SDIRK internal routines ...
+   template <class Functor, typename Counters>
+   int solve ( ValueType *tcur, ValueType *hcur, Counters* counters, ValueType y[], Functor& func)
+   {
+      int ierr = ERR_SUCCESS;
+
+      const int neq = this->neq;
+
+      #define nst (counters->nst)
+      #define nfe (counters->nfe)
+      #define nje (counters->nje)
+      #define nlu (counters->nlu)
+      #define nni (counters->nni)
+      #define iter (counters->nit)
+      #define h (*hcur)
+      #define t (*tcur)
+
+      const int InterpolateNewton  = 1;	// Start at zero (0) or interpolate a starting guess (1)
+      const int MaxNewtonIterations= 8;	// Max number of newton iterations
+      const double NewtonThetaMin  = 0.005; // Minimum convergence rate for the Newton Iteration (0.001)
+      const double NewtonThetaMax  = 0.999; // Maximum residual drop acceptable
+      const double NewtonTolerance = 0.03;  // Convergence criteria
+      const double Qmax = 1.2;		// Max h-adaption to recycle M
+      const double Qmin = 1.;		// Min ""
+
+      ValueType *rwk = m_rwk.getPointer();
+      IndexType *iwk = m_iwk.getPointer();
+
+      // Estimate the initial step size ...
+      {
+         auto mask = (*hcur < this->h_min);
+         if ( any(mask) )
+         {
+            ValueType h0 = *hcur;
+            //std::cout << "Before hin: " << h0 << ", " << mask << "\n";
+            ierr = this->hin ( *tcur, &h0, y, rwk, func );
+            if (ierr != ERR_SUCCESS)
+            {
+               fprintf(stderr,"Failure solve(): %d %s\n", ierr, GetErrorString(ierr));
+               return ierr;
+            }
+            //std::cout << "After hin: " << h0 << "\n";
+
+            *hcur = select( mask, h0, *hcur );
+         }
+         //printf("hin = %s %s %e %e\n", toString(*hcur).c_str(), toString(mask).c_str(), this->h_min, this->h_max);
+      }
+
+      // Zero the counters ...
+      nst = 0;
+      nfe = 0;
+      nlu = 0;
+      nje = 0;
+      nni = 0;
+      iter = 0;
+
+      // Set the work arrays ...
+      ValueType *RESTRICT fy   = rwk;
+      ValueType *RESTRICT del  = fy + (neq);
+      ValueType *RESTRICT Jy   = del + (neq);
+      ValueType *RESTRICT M    = Jy + (neq*neq);
+      ValueType *RESTRICT z    = M + (neq*neq);
+      ValueType *RESTRICT g    = z + (neq*this->numStages);
+      ValueType *RESTRICT yerr = del;
+
+      bool ComputeJ = 1;
+      bool ComputeM = 1;
+
+      MaskType not_done = abs(t - this->t_stop) > ValueType( this->t_round );
+      while ( any(not_done) )
+      {
+         // Construct the Iteration matrix ... if needed.
+         if (ComputeM)
+         {
+            // Compute the Jacobian matrix or recycle an old one.
+            if (ComputeJ)
+            {
+               //if (jac)
+               //   jac (neq, t, y, Jy, user_data);
+               //else
+               {
+                  // Compute the RHS ... the fd algorithm expects it.
+                  //if (func)
+                     func (neq, t, y, fy);
+                  //else
+                  //   cklib_callback (neq, t, y, fy, user_data);
+                  nfe++;
+
+                  this->fdjac ( t, h, y, fy, Jy, func );
+                  nfe += neq;
+               }
+
+               nje++;
+            }
+
+            // Compute M := 1/(gamma*h) - J
+            const ValueType one_hgamma = 1.0 / (h * this->gamma);
+
+            for (int j = 0; j < neq; ++j)
+            {
+               ValueType *RESTRICT Mcol = &M[(j*neq)];
+               ValueType *RESTRICT Jcol = &Jy[(j*neq)];
+               for (int i = 0; i < neq; ++i)
+                  Mcol[(i)] = -Jcol[(i)];
+
+               Mcol[(j)] += one_hgamma;
+            }
+
+            // Factorization M
+            this->ludec( neq, M, iwk );
+            nlu++;
+         }
+
+         const BaseIndexType Status_None      = 0,
+                             Status_Converged = 1,
+                             Status_Diverged  = 2;
+         IndexType Status(Status_None);
+
+         MaskType  Accepted; // All are intialized inside of stage loop.
+         ValueType HScalingFactor;
+         ValueType NewtonTheta;
+
+         for (int s = 0; s < this->numStages; s++)
+         {
+            // Initial the RK stage vectors Z_i and G.
+            ValueType *z_s = &z[(s*neq)];
+            this->dzero (neq, z_s);
+            this->dzero (neq, g);
+
+            // Compute the function at this stage ...
+            if (s)
+            {
+               for (int j = 0; j < s; ++j)
+               {
+                  // G = \Sum_j Theta_i,j*Z_j = h * \Sum_j A_i,j*F(Z_j)
+                  ValueType *z_j = &z[(j*neq)];
+                  this->daxpy1 (neq, Theta_(s,j), z_j, g);
+
+                  // Z_i = \Sum_j Alpha(i,j)*Z_j
+                  if (InterpolateNewton)
+                     this->daxpy1 (neq, Alpha_(s,j), z_j, z_s);
+               }
+            }
+
+            // Solve the non-linear problem with the Newton-Raphson method.
+            Status = Status_None;
+            Accepted = false;
+            HScalingFactor = 0.8;
+            NewtonTheta = NewtonThetaMin;
+            ValueType NewtonResidual;
+
+            for (int NewtonIter = 0; NewtonIter < MaxNewtonIterations; NewtonIter++, nni++)
+            {
+               // 1) Build the RHS of the root equation: F := G + (h*gamma)*f(y+Z_s) - Z_s
+               for (int k = 0; k < neq; ++k)
+                  del[(k)] = y[(k)] + z_s[(k)];
+
+               func (neq, t, del, fy);
+               nfe++;
+
+               const ValueType hgamma = h * this->gamma;
+               for (int k = 0; k < neq; ++k)
+                  del[(k)] = g[(k)] + hgamma * fy[(k)] - z_s[(k)];
+                //del[(k)] = g[(k)] - z_s[(k)] + hgamma * fy[(k)];
+
+               // 2) Solve the linear problem: M*delz = (1/hgamma)F ... so scale F first.
+               this->dscal (neq, 1.0/hgamma, del);
+               this->lusol (neq, M, iwk, del);
+
+               // 3) Check the convergence and convergence rate
+               // 3.1) Compute the norm of the correction.
+               const ValueType dnorm = this->wnorm ( del, y);
+
+               std::cout << "miter: " << iter <<" " << s << " "<< NewtonIter << dnorm << "\n";
+
+               // 3.2) If not the first iteration, estimate the rate.
+               if (NewtonIter != 0)
+               {
+                  NewtonTheta = dnorm / NewtonResidual; // How much as the residual changed from last iteration.
+
+                  MaskType isDiverging = (NewtonTheta >= NewtonThetaMax);
+
+                  ValueType ConvergenceRate = NewtonTheta / (1.0 - NewtonTheta); // Possible FLTEXP here.
+
+                  std::cout << "miter= " << NewtonIter << dnorm << ConvergenceRate << isDiverging << "\n";
+
+                  // If one is diverging, may just give up early all around.
+                  // Use the status flag to change or hold h.
+                  if ( any( isDiverging ) )
+                  {
+                     Status = select( isDiverging, Status_Diverged, Status );
+                     std::cout << "any NewtonTheta >= NewtonThetaMax " << h << NewtonTheta << isDiverging << "\n";
+                     break;
+                  }
+
+                  // So, nobody is diverging. Test if any are converging too slowly.
+                  // We'll shrink h and restart, too.
+                  // Predict the error after Max iterations with the current rate:
+                  // ... res * Theta^(ItersLeft/(1-Theta))
+                  ValueType PredictedError = dnorm * pow( NewtonTheta,
+                                       (MaxNewtonIterations-NewtonIter)/(1.0-NewtonTheta));
+
+                  MaskType PredictedErrorTooLarge = ( PredictedError > NewtonTolerance );
+                  if ( any( PredictedErrorTooLarge ) )
+                  {
+                     // Doubtful we'll converge, shrink h and try again.
+                     ValueType QNewton = fmin(10.0, PredictedError / NewtonTolerance);
+                     HScalingFactor = select( PredictedErrorTooLarge,
+                                              0.9 * pow( QNewton, -1.0 / (1.0 + MaxNewtonIterations - NewtonIter)),
+                                              1.0 );
+                     std::cout << "PredictedError > NewtonTolerance " << h << HScalingFactor << PredictedErrorTooLarge << nst << s << NewtonIter << "\n";
+                     break;
+                  }
+
+                  // So, nobody is diverging and none are predicted to fail. Test for new convergence.
+                  Accepted = (ConvergenceRate * dnorm < NewtonTolerance);
+                  std::cout << "Accepted: " << NewtonIter << Accepted << Status << "\n";
+               }
+
+               // Save the residual norm for the next iteration unless I'm already converged.
+               MaskType UpdateSolution = (Status == Status_None);
+               NewtonResidual = select( UpdateSolution, dnorm, NewtonResidual );
+
+               // 4) Update the solution if newly accepted: Z_s <- Z_s + delta
+               ValueType OneOrZero = select( UpdateSolution, ValueType(1), ValueType(0) );
+               this->daxpy (neq, OneOrZero, del, z_s);
+
+               // Finally, test if everyone's finally finished.
+               Status = select( Accepted, Status_Converged, Status );
+               if ( all( Accepted ) )
+                  break;
+            }
+
+            if ( any(!Accepted) )
+            {
+               //printf("failed to converge %d %d.\n", iter, s);
+               ComputeJ = 0; // Jacobian is still valid
+               ComputeM = 1; // M is invalid since h will change (perhaps) drastically.
+               break;
+               //return 0;
+            }
+
+         } // ... stages
+
+         if ( all( Accepted ) )
+         {
+            // Compute the error estimation of the trial solution.
+            this->dzero (neq, yerr);
+            for (int j = 0; j < this->numStages; ++j)
+            {
+               ValueType *z_j = &z[(j*neq)];
+               if (this->E[j] != 0.0)
+                  this->daxpy1 (neq, this->E[j], z_j, yerr);
+            }
+
+            ValueType herr = fmax(1.0e-20, this->wnorm ( yerr, y));
+
+            // Is the error acceptable?
+            Accepted = (herr <= 1.0) || (h <= this->h_min);
+            if ( any( Accepted ) )
+            {
+               // If stiffly-accurate, Z_s with s := numStages, is the solution.
+               // Else, sum the stage solutions: y_n+1 <- y_n + \Sum_j D_j * Z_j
+               for (int j = 0; j < this->numStages; ++j)
+               {
+                  ValueType *z_j = &z[(j*neq)];
+                  if (this->D[j] != 0.0)
+                  {
+                     // Only update solutions that were accepted.
+                     ValueType ZeroOrDj = select( Accepted, this->D[j], 0.0 );
+                     this->daxpy ( neq, ZeroOrDj, z_j, y );
+                  }
+               }
+
+               t = select( Accepted, t + h, t );
+               nst = select( Accepted, nst+1, nst );
+            }
+
+            HScalingFactor = 0.9 * pow( 1.0 / herr, (1.0 / this->ELO));
+
+            // Reuse the Jacobian if the Newton Solver is converging fast enough
+            // ... for everyone. (any-all)
+            ComputeJ = any( NewtonTheta > NewtonThetaMin );
+
+            // Don't refine if it's not a big step and we could reuse the M matrix.
+            bool recycle_M = not(ComputeJ) and all( HScalingFactor >= Qmin & HScalingFactor <= Qmax );
+            if (recycle_M)
+            {
+               ComputeM = 0;
+               HScalingFactor = 1.0;
+            }
+            else
+               ComputeM = 1;
+         }
+
+         // Restrict the rate of change in dt
+         HScalingFactor = fmax( HScalingFactor, 1.0 / this->adaption_limit);
+         HScalingFactor = fmin( HScalingFactor,       this->adaption_limit);
+
+         not_done = abs(t - this->t_stop) > ValueType( this->t_round );
+
+#if defined(VERBOSE) && (VERBOSE > 0)
+         if (iter % VERBOSE == 0)
+         {
+            std::cout << "iter= " << iter;
+            std::cout << " accept= " << Accepted;
+            std::cout << " not_done= " << not_done;
+            std::cout << " t= " << t;
+            std::cout << " h= " << h;
+            std::cout << " fact= " << HScalingFactor;
+            std::cout << " T= " << y[getTempIndex(neq)] << "\n";
+         }
+#endif
+
+         ValueType h0 = h;
+
+         // Apply grow/shrink factor for next step.
+         h *= HScalingFactor;
+
+         // Limit based on the upper/lower bounds
+         h = fmin(h, this->h_max);
+         h = fmax(h, this->h_min);
+
+         // Don't overshoot the final time ...
+         h = select( not_done & ((t + h) > this->t_stop), this->t_stop - t, h );
+
+         // Stretch the final step if we're really close
+         // ... and we didn't just fail
+         // ... and we're already re-computing M.
+         ComputeM = any( h != h0 );
+         if ( ComputeM )
+         {
+            MaskType Stretch_h = Accepted & ( abs((t + h) - this->t_stop) < this->h_min );
+            h = select( Stretch_h, this->t_stop - t, h );
+         }
+
+         ++iter;
+         if ( this->max_iters && iter > this->max_iters )
+         {
+            ierr = ERR_TOO_MUCH_WORK;
+            //printf("(iter > max_iters)\n");
+            break;
+         }
+      }
+
+      return ierr;
+
+      #undef nst
+      #undef nfe
+      #undef nje
+      #undef nlu
+      #undef nni
+      #undef iter
+      #undef h
+      #undef t
+   }
+
+};
+   #undef __matrix_index
+   #undef A_
+   #undef Theta_
+   #undef Alpha_
 
 template <typename Functor, typename RHSptr>
 void simd_rk_driver ( const int numProblems, const double *u_in, const double t_stop, const Functor& func, const RHSptr rhs_func, const ckdata_t *RESTRICT ck )
@@ -2260,6 +2819,197 @@ void simd_ros_driver ( const int numProblems, const double *u_in, const double t
       else
       {
          ros_counters_t counters;
+         for (int i = i0; i < numProblems; ++i)
+            scalar_solver( i, vector_out, &counters );
+      }
+   }
+
+   time_vector = WallClock() - time_vector;
+
+   printf("SIMD timer: %f %f %.1f\n", 1000.*time_vector, 1000.*time_scalar, time_scalar/time_vector);
+
+   {
+      double err2 = 0, ref2 = 0;
+      double errmax = 0;
+      int ierrmax = -1;
+      for (int i = 0; i < numProblems; ++i)
+      {
+         const double *v_out = vector_out.getPointer() + neq*i;
+         const double *s_out = scalar_out.getPointer() + neq*i;
+         double diff = std::abs( s_out[ getTempIndex(neq) ]
+                               - v_out[ getTempIndex(neq) ] );
+         err2 += sqr( diff );
+         ref2 += sqr( s_out[ getTempIndex(neq) ] );
+
+         if ( diff > errmax ) {
+            errmax = diff;
+            ierrmax = i;
+         }
+      }
+
+      printf("err2= %e %e %e %d %e %d\n", err2, ref2, std::sqrt(err2)/std::sqrt(ref2), numProblems % VectorLength, errmax, ierrmax);
+   }
+   {
+      double err2 = 0, ref2 = 0;
+      double errmax = 0;
+      int ierrmax = -1;
+      for (int k = 0; k < kk; ++k)
+         for (int i = 0; i < numProblems; ++i)
+         {
+            const double *v_out = vector_out.getPointer() + neq*i;
+            const double *s_out = scalar_out.getPointer() + neq*i;
+            double diff = std::abs( s_out[ getFirstSpeciesIndex(neq)+k ]
+                                  - v_out[ getFirstSpeciesIndex(neq)+k ] );
+            err2 += sqr( diff );
+            ref2 += sqr( s_out[ getFirstSpeciesIndex(neq)+k ] );
+
+            if ( diff > errmax ) {
+               errmax = diff;
+               ierrmax = i;
+            }
+         }
+
+      printf("err2= %e %e %e %e %d\n", err2, ref2, std::sqrt(err2)/std::sqrt(ref2), errmax, ierrmax);
+   }
+
+   return;
+}
+
+template <typename Functor, typename RHSptr>
+void simd_sdirk_driver ( const int numProblems, const double *u_in, const double t_stop, const Functor& func, const RHSptr rhs_func, const ckdata_t *RESTRICT ck )
+{
+   const int kk = ck->n_species;
+   const int neq = kk+1;
+   const double p = func.getPressure();
+
+   typedef typename VCL_TypeSelector<double,4>::value_type SimdType;
+   typedef typename VCL_MaskSelector<SimdType>::mask_type MaskType;
+   const int VectorLength = VCL_Length<SimdType>::length;
+
+   printf("Instruction Set= %d %s %d %s\n", INSTRSET, typeid(SimdType).name(), VectorLength, typeid( MaskType).name());
+
+   VectorType<double,Alignment> scalar_out( neq * numProblems );
+   VectorType<double,Alignment> vector_out( neq * numProblems );
+
+   sdirk_t sdirk;
+
+   sdirk_create (&sdirk, neq, S4a);
+
+   sdirk.max_iters = 1000;
+   sdirk.min_iters = 1;
+
+   int lenrwk = sdirk_lenrwk (&sdirk);
+   int leniwk = sdirk_leniwk (&sdirk);
+   VectorType<double,Alignment> rwk( VectorLength * lenrwk );
+   VectorType<int,Alignment> iwk( VectorLength * leniwk );
+   VectorType<double,Alignment> u( VectorLength * neq );
+
+   int nst = 0, nit = 0, nfe = 0, nje = 0, nlu = 0, nni = 0;
+
+   auto scalar_solver = [&](const int i, VectorType<double,Alignment>& out, sdirk_counters_t *counters)
+   {
+      for (int k = 0; k < neq; ++k)
+         u[k] = u_in[ i*neq + k ];
+
+      const double T0 = u_in[ i*neq + getTempIndex(neq) ];
+
+      double t = 0, h = 0;
+
+      sdirk_init (&sdirk, t, t_stop);
+
+      double t_begin = WallClock();
+
+      int ierr = sdirk_solve (&sdirk, &t, &h, counters, u.getPointer(), iwk.getPointer(), rwk.getPointer(), rhs_func, /*jac_func*/NULL, (void*)&func);
+      if (ierr != ROS_SUCCESS)
+      {
+         fprintf(stderr,"%d: sdirk_solve error %d %d %d\n", i, ierr, counters->niters, sdirk.max_iters);
+         exit(-1);
+      }
+
+      double t_end = WallClock();
+
+      const int _nit = counters->niters;
+      const int _nst = counters->nst;
+      const int _nfe = counters->nfe;
+      const int _nje = counters->nje;
+      const int _nlu = counters->nlu;
+      const int _nni = counters->nni;
+
+      nit += _nit;
+      nst += _nst;
+      nfe += _nfe;
+      nje += _nje;
+      nlu += _nlu;
+      nni += _nni;
+
+      for (int k = 0; k < neq; ++k)
+         out[i*neq + k] = u[k];
+
+      if (i % 1 == 0)
+         printf("%d: %d %d %d %d %d %e %e %f %f\n", i, _nst, _nit, _nfe, _nlu, _nni, u[ getTempIndex(neq) ], T0, (u[ getTempIndex(neq) ]-T0)/T0, 1000*(t_end-t_begin));
+   };
+
+   double time_scalar = WallClock();
+
+   for (int i = 0; i < numProblems; ++i)
+   {
+      sdirk_counters_t counters;
+      scalar_solver(i, scalar_out, &counters);
+      //if (i % 10 == 0)
+      //   printf("%d: %d %d %f\n", i, counters.nsteps, counters.niters, scalar_out[i*neq+getTempIndex(neq)] );
+   }
+
+   sdirk_destroy(&sdirk);
+
+   time_scalar = WallClock() - time_scalar;
+
+   double time_vector = WallClock();
+
+   simd_cklib_functor<SimdType> simd_func( ck, p );
+   typedef SimdSdirkSolverType<SimdType> SimdSolverType;
+   SimdSolverType simd_solver( neq );
+   simd_solver.max_iters=100;
+
+   for (int i0 = 0; i0 < numProblems; i0 += VectorLength)
+   {
+      if ( i0 + VectorLength <= numProblems )
+      {
+         for (int i = 0; i < VectorLength; ++i)
+         {
+            const double *ui = u_in + neq*(i0+i);
+            for (int j = 0; j < neq; ++j)
+               u[j*VectorLength+i] = ui[j];
+         }
+
+         SimdType *v_u = (SimdType *) u.getPointer();
+
+         SimdType T0 = v_u[ getTempIndex(neq) ];
+
+         SimdType t(0), h(0);
+         typename SimdSolverType::CountersType counters;
+
+         simd_solver.init( 0.0, t_stop );
+         int ierr = simd_solver.solve ( &t, &h, &counters, v_u, simd_func );
+         if (ierr != ERR_SUCCESS)
+         {
+            fprintf(stderr,"%d: simd_solver error %d %s\n", i0, ierr, GetErrorString(ierr));
+            if (ierr == ERR_TOO_MUCH_WORK)
+               fprintf(stderr,"--: simd_solver nit= %d %s\n", counters.nit, toString(counters.nst).c_str());
+            exit(-1);
+         }
+
+         for (int i = 0; i < VectorLength; ++i)
+         {
+            double *v_out = vector_out.getPointer() + neq*(i0+i);
+            for (int j = 0; j < neq; ++j)
+               v_out[j] = u[j*VectorLength+i];
+         }
+
+         printf("i0: %d %s %d %s %s %s\n", i0, toString(counters.nst).c_str(), counters.nit, toString( v_u[getTempIndex(neq)] ).c_str(), toString(T0).c_str(), toString((v_u[getTempIndex(neq)]-T0)/T0).c_str());
+      }
+      else
+      {
+         sdirk_counters_t counters;
          for (int i = i0; i < numProblems; ++i)
             scalar_solver( i, vector_out, &counters );
       }
