@@ -23,6 +23,12 @@ namespace SIMD
 
 const int Alignment = 64;
 
+#ifndef __DEFAULT_VECTOR_LENGTH
+#define __DEFAULT_VECTOR_LENGTH (4)
+#endif
+
+const int DefaultVectorLength = __DEFAULT_VECTOR_LENGTH;
+
 // Master VCL header
 #ifndef  MAX_VECTOR_SIZE
 # define MAX_VECTOR_SIZE (512)
@@ -667,7 +673,7 @@ void test_simd_rhs ( const int numProblems, const double *u_in, Func& func, cons
    const int kk = ck->n_species;
    const int neq = kk+1;
 
-   typedef typename VCL_TypeSelector<double,4>::value_type SimdType;
+   typedef typename VCL_TypeSelector<double,DefaultVectorLength>::value_type SimdType;
    typedef typename VCL_MaskSelector<SimdType>::mask_type MaskType;
    //const int VectorLength = sizeof(SimdType) / sizeof(double);
    const int VectorLength = VCL_Length<SimdType>::length;
@@ -784,7 +790,7 @@ enum ErrorFlags { ERR_SUCCESS         = 0,
                   ERR_TDIST_TOO_SMALL = 2,
                   ERR_HIN_MAX_ITERS   = 3 };
 
-const ErrorFlags GetErrorInt ( const int errflag )
+ErrorFlags GetErrorInt ( const int errflag )
 {
    switch ( errflag )
    {
@@ -1364,8 +1370,8 @@ struct SimdERKSolverType : public CommonSolverType<ValueType>
       m_rwk.resize( get_lenrwk() );
    }
 
-   constexpr size_t get_lenrwk(const int _neq) const { return (8 * _neq); }
-   constexpr size_t get_lenrwk(void) const { return (8 * this->neq); }
+   size_t get_lenrwk(const int _neq) const { return (8 * _neq); }
+   size_t get_lenrwk(void) const { return (8 * this->neq); }
 
    template <class Functor>
    int oneStep (const ValueType& h,
@@ -1638,7 +1644,7 @@ struct SimdRosSolverType : public CommonSolverType<_ValueType>
       m_iwk.resize( this->get_leniwk() );
    }
 
-   constexpr size_t get_lenrwk(const int _neq) const
+   size_t get_lenrwk(const int _neq) const
    {
       int lenrwk = 0;
       lenrwk +=  _neq;		// fy
@@ -1650,13 +1656,13 @@ struct SimdRosSolverType : public CommonSolverType<_ValueType>
       return lenrwk;
    }
 
-   constexpr size_t get_leniwk(const int _neq) const
+   size_t get_leniwk(const int _neq) const
    {
       return (_neq); // ipiv
    }
 
-   constexpr size_t get_lenrwk(void) const { return this->get_lenrwk(this->neq); }
-   constexpr size_t get_leniwk(void) const { return this->get_leniwk(this->neq); }
+   size_t get_lenrwk(void) const { return this->get_lenrwk(this->neq); }
+   size_t get_leniwk(void) const { return this->get_leniwk(this->neq); }
 
    // 4th/3rd-order L-stable Rosenbrock method with 4 stages.
    // -- E. Hairer and G. Wanner, "Solving ordinary differential equations II:
@@ -2026,7 +2032,7 @@ struct SimdSdirkSolverType : public CommonSolverType<_ValueType>
       m_iwk.resize( this->get_leniwk() );
    }
 
-   constexpr size_t get_lenrwk(const int _neq) const
+   size_t get_lenrwk(const int _neq) const
    {
       int lenrwk = 0;
       lenrwk +=  _neq;			 // fy
@@ -2039,13 +2045,13 @@ struct SimdSdirkSolverType : public CommonSolverType<_ValueType>
       return lenrwk;
    }
 
-   constexpr size_t get_leniwk(const int _neq) const
+   size_t get_leniwk(const int _neq) const
    {
       return (_neq); // ipiv
    }
 
-   constexpr size_t get_lenrwk(void) const { return this->get_lenrwk(this->neq); }
-   constexpr size_t get_leniwk(void) const { return this->get_leniwk(this->neq); }
+   size_t get_lenrwk(void) const { return this->get_lenrwk(this->neq); }
+   size_t get_leniwk(void) const { return this->get_leniwk(this->neq); }
 
    // 4th/3rd-order L-stable SDIRK method with 5 stages.
    // -- E. Hairer and G. Wanner, "Solving ordinary differential equations II:
@@ -2532,7 +2538,7 @@ void simd_rk_driver ( const int numProblems, const double *u_in, const double t_
    const int neq = kk+1;
    const double p = func.getPressure();
 
-   typedef typename VCL_TypeSelector<double,4>::value_type SimdType;
+   typedef typename VCL_TypeSelector<double,DefaultVectorLength>::value_type SimdType;
    typedef typename VCL_MaskSelector<SimdType>::mask_type MaskType;
    const int VectorLength = VCL_Length<SimdType>::length;
 
@@ -2588,7 +2594,7 @@ void simd_rk_driver ( const int numProblems, const double *u_in, const double t_
          out[i*neq + k] = u[k];
 
       if (i % VectorLength == 0)
-         printf("%d: %d %d %d %e %e %f %f\n", i, _nst, _nit, _nfe, u[ getTempIndex(neq) ], T0, (u[getTempIndex(neq)]-T0)/T0, 1000*(t_end-t_begin));
+         printf("%d: final %d %d %d %e %e %f %f\n", i, _nst, _nit, _nfe, u[ getTempIndex(neq) ], T0, (u[getTempIndex(neq)]-T0)/T0, 1000*(t_end-t_begin));
    };
 
    double time_scalar = WallClock();
@@ -2647,7 +2653,11 @@ void simd_rk_driver ( const int numProblems, const double *u_in, const double t_
                v_out[j] = u[j*VectorLength+i];
          }
 
-         printf("i0: %d %s %d %s %s\n", i0, toString(counters.nst).c_str(), counters.nit, toString( v_u[getTempIndex(neq)] ).c_str(), toString(T0).c_str(), toString((v_u[getTempIndex(neq)]-T0)/T0).c_str());
+         std::cout << i0 << ": final " << counters.nst
+                         << " "  << counters.nit
+                         << " "  << v_u[getTempIndex(neq)]
+                         << " "  << T0
+                         << " "  << (v_u[getTempIndex(neq)]-T0)/T0 << "\n";
       }
       else
       {
@@ -2715,7 +2725,7 @@ void simd_ros_driver ( const int numProblems, const double *u_in, const double t
    const int neq = kk+1;
    const double p = func.getPressure();
 
-   typedef typename VCL_TypeSelector<double,4>::value_type SimdType;
+   typedef typename VCL_TypeSelector<double,DefaultVectorLength>::value_type SimdType;
    typedef typename VCL_MaskSelector<SimdType>::mask_type MaskType;
    const int VectorLength = VCL_Length<SimdType>::length;
 
@@ -2775,7 +2785,7 @@ void simd_ros_driver ( const int numProblems, const double *u_in, const double t
          out[i*neq + k] = u[k];
 
       if (i % VectorLength == 0)
-         printf("%d: %d %d %d %e %e %f %f\n", i, _nst, _nit, _nfe, u[ getTempIndex(neq) ], T0, (u[ getTempIndex(neq) ]-T0)/T0, 1000*(t_end-t_begin));
+         printf("%d: final %d %d %d %e %e %f %f\n", i, _nst, _nit, _nfe, u[ getTempIndex(neq) ], T0, (u[ getTempIndex(neq) ]-T0)/T0, 1000*(t_end-t_begin));
    };
 
    double time_scalar = WallClock();
@@ -2929,7 +2939,7 @@ void simd_sdirk_driver ( const int numProblems, const double *u_in, const double
    const int neq = kk+1;
    const double p = func.getPressure();
 
-   typedef typename VCL_TypeSelector<double,4>::value_type SimdType;
+   typedef typename VCL_TypeSelector<double,DefaultVectorLength>::value_type SimdType;
    typedef typename VCL_MaskSelector<SimdType>::mask_type MaskType;
    const int VectorLength = VCL_Length<SimdType>::length;
 

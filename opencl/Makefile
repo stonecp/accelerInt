@@ -50,6 +50,7 @@ ifeq ($(intel),1)
    CXX	= icpc
    OMP	= -openmp -openmp-report
    #CFLAGS += -vec-report2
+   CFLAGS += -xHost -qopt-report=5
 else
    CC	= gcc -std=c99
    CXX	= g++
@@ -121,12 +122,20 @@ endif
 #LDFLAGS += -ltbbmalloc_proxy -ltbbmalloc -L/opt/apps/intel/13/composer_xe_2013.2.146/tbb/lib/mic
 
 #CFLAGS += -D__LEVEL1_DCACHE_LINESIZE=`getconf LEVEL1_DCACHE_LINESIZE`
-#CFLAGS += -D__ALIGNMENT=`getconf LEVEL1_DCACHE_LINESIZE`
 
 ifeq ($(align),)
-   CFLAGS += -D__ALIGNMENT=32
+   #CFLAGS += -D__ALIGNMENT=32
+   L1_ALIGNMENT=$(shell getconf LEVEL1_DCACHE_LINESIZE)
+   CFLAGS += -D__ALIGNMENT=$(L1_ALIGNMENT)
+   CXXFLAGS += -D__ALIGNMENT=$(L1_ALIGNMENT)
 else
    CFLAGS += -D__ALIGNMENT=$(align)
+   CXXFLAGS += -D__ALIGNMENT=$(align)
+endif
+
+ifneq ($(vl),)
+   CFLAGS += -D__DEFAULT_VECTOR_LENGTH=$(vl)
+   CXXFLAGS += -D__DEFAULT_VECTOR_LENGTH=$(vl)
 endif
 
 ifeq ($(intel),1)
@@ -188,7 +197,7 @@ objs:
 
 clean:
 	@echo "Cleaning objects ..."
-	@/bin/rm -fv ${OBJS} *.o __kernel_source.cl *.d
+	@/bin/rm -fv ${OBJS} *.o __kernel_source.cl *.d *.optrpt
 
 veryclean: clean
 	@echo "Cleaning executables ..."

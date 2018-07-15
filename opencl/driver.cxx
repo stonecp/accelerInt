@@ -451,7 +451,7 @@ int main (int argc, char* argv[])
          else if (ck.sp_name[k].compare("N2")  == 0) iN2  = k;
          else if (ck.sp_name[k].compare("CH4") == 0) iCH4 = k;
 
-      printf("iH2=%d, iO2=%d, iN2=%d, iCH4\n", iH2, iO2, iN2, iCH4);
+      printf("iH2=%d, iO2=%d, iN2=%d, iCH4=%d\n", iH2, iO2, iN2, iCH4);
 
       std::vector<double> x(ck.n_species);
       std::vector<double> y(ck.n_species);
