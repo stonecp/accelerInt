@@ -56,6 +56,7 @@ else
    CXX	= g++
 #  CFLAGS += -Wno-enum-compare
    CFLAGS += -mtune=native
+   CFLAGS += -Wfatal-errors
    #CFLAGS += -ftree-vectorizer-verbose=2
    OMP	= -fopenmp
 endif
