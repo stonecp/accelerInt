@@ -58,7 +58,12 @@ template <typename MaskType>
 inline bool any( const MaskType& mask ) { return horizontal_or( mask ); }
 
 template <typename SimdType>
-std::string toString (const SimdType& x)
+inline
+   typename std::enable_if<
+                  SIMD_isScalar<SimdType>::value == false,
+                  std::string
+                          >::type
+toString (const SimdType& x)
 {
    const int len = SimdType::size();
    std::ostringstream oss;

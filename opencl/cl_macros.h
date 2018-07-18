@@ -30,7 +30,7 @@
 
 #define __inline inline
 
-#if 1
+#if 0
   #define __tmpstr2(__x__) #__x__
   #define __tmpstr1(__x__) __tmpstr2(__x__)
   #pragma message "__blockSize   = " __tmpstr1(__blockSize)
