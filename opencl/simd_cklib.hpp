@@ -18,7 +18,7 @@
 #include "cklib.h"
 #include "clock.h"
 
-#include "simd_vcl.hpp"
+#include "simd_dtypes.hpp"
 
 namespace SIMD
 {
@@ -562,7 +562,7 @@ void test_simd_rhs ( const int numProblems, const double *u_in, Func& func, cons
    typedef typename SIMD_MaskSelector<SimdType>::mask_type MaskType;
    const int VectorLength = SIMD_Length<SimdType>::length;
 
-   printf("Instruction Set= %d %s %d %s\n", INSTRSET, typeid(SimdType).name(), VectorLength, typeid( MaskType).name());
+   printf("SimdType= %s %d %s\n", typeid(SimdType).name(), VectorLength, typeid( MaskType).name());
 
    const double p = func.getPressure();
 
@@ -632,7 +632,7 @@ void test_simd_rhs ( const int numProblems, const double *u_in, Func& func, cons
          time_vector += (WallClock() - time_start);
       }
 
-   printf("SIMD timer: %f %f %.1f %d %e\n", 1000.*time_vector, 1000.*time_scalar, time_scalar/time_vector, sum_s == sum_v, fabs(sum_s-sum_v)/fabs(sum_s));
+   printf("SIMD timer: %f %f %.1f %d %e\n", 1000.*time_vector, 1000.*time_scalar, time_scalar/time_vector, sum_s == sum_v, std::fabs(sum_s-sum_v)/std::fabs(sum_s));
 
    {
       double err2 = 0, ref2 = 0;

@@ -45,7 +45,7 @@
 
 #define ENABLE_SIMD
 #ifdef ENABLE_SIMD
-# include "simd_vcl.hpp"
+# include "simd_dtypes.hpp"
 # include "simd_cklib.hpp"
 # include "simd_solvers.hpp"
 #endif

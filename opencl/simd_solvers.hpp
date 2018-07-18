@@ -18,7 +18,7 @@
 #include "cklib.h"
 #include "clock.h"
 
-#include "simd_vcl.hpp"
+#include "simd_dtypes.hpp"
 #include "simd_cklib.hpp"
 
 namespace SIMD
@@ -316,8 +316,8 @@ public:
 
       // bound and bias estimate
       *h0 = hnew * 0.5;
-      *h0 = max(*h0, hlb);
-      *h0 = min(*h0, hub);
+      *h0 = fmax(*h0, hlb);
+      *h0 = fmin(*h0, hub);
 
       //printf("h0=%e, hlb=%e, hub=%e\n", h0, hlb, hub);
 
@@ -327,7 +327,7 @@ public:
    ValueType getErrorWeight ( const int k, const ValueType *RESTRICT y ) const
    {
       //return (this->s_rtol * abs( y[k] )) + this->s_atol;
-      return 1.0/((this->s_rtol * abs( y[k] )) + this->s_atol);
+      return 1.0/((this->s_rtol * fabs( y[k] )) + this->s_atol);
    }
 
    ValueType wnorm (const ValueType *RESTRICT x, const ValueType *RESTRICT y) const
@@ -368,7 +368,7 @@ public:
          dst[k] = if_then_else (mask, src[k], dst[k]);
    }*/
 
-   inline void dscal (const int len, const double alpha, ValueType *RESTRICT y ) const
+   /*inline void dscal (const int len, const double alpha, ValueType *RESTRICT y ) const
    {
       // Alpha is scalar type ... and can be easily checked.
       if (alpha == 1.0)
@@ -379,7 +379,7 @@ public:
          for (int k = 0; k < len; ++k)
             y[(k)] *= alpha;
       }
-   }
+   }*/
    inline void dscal (const int len, const ValueType& alpha, ValueType *RESTRICT y ) const
    {
       #pragma ivdep
@@ -414,6 +414,106 @@ public:
          y[k] += alpha * x[k];
    }
 
+   // SIMD version.
+   template <typename _ValueType>
+   typename std::enable_if< (SIMD_isScalar<_ValueType>::value == 0), IndexType >::type
+      lu_pivot ( const int k, const int n, _ValueType *RESTRICT A ) const
+   {
+      enum { nelems = this->vector_length };
+
+      alignas(Alignment) BaseIndexType all_pivk[nelems];
+
+      ValueType *A_k = A + (k*n); // pointer to this column
+
+      /* find pivot row number */
+      for (int el = 0; el < nelems; ++el)
+      {
+         int pivk = k;
+         double Akp = A_k[pivk].extract(el);
+         for (int i = k+1; i < n; ++i)
+         {
+            //const double Aki = __read_from( A_k[__getIndex(i)], el);
+            double Aki = A_k[i].extract(el);
+            if ( std::fabs(Aki) > std::fabs(Akp) )
+            {
+               pivk = i;
+               Akp = Aki;
+            }
+         }
+
+         // Test for singular value ...
+         if (Akp == 0.0)
+         {
+            //ierr = (k+1);
+            //printf("Singular value %d %d\n", k, el);
+            break;
+         }
+
+         /* swap a(k,1:N) and a(piv,1:N) if necessary */
+         if ( pivk != k )
+         {
+            ValueType *A_i = A; // pointer to the first column
+            for (int i = 0; i < n; ++i, A_i += (n))
+            {
+               const double Aik = A_i[k   ].extract(el);
+               const double Aip = A_i[pivk].extract(el);
+               A_i[k   ].insert( el, Aip );
+               A_i[pivk].insert( el, Aik );
+            }
+         }
+
+         all_pivk[el] = pivk;
+
+      } // End scalar section
+
+      return IndexType().load_a( all_pivk );
+   }
+
+   // Scalar version.
+   template <typename _ValueType>
+   typename std::enable_if< SIMD_isScalar<_ValueType>::value, IndexType >::type
+      lu_pivot ( const int k, const int n, _ValueType *RESTRICT A ) const
+   {
+      /* find pivot row number */
+
+      ValueType *A_k = A + (k*n); // pointer to this column
+
+      int pivk = k;
+      double Akp = A_k[pivk];
+      for (int i = k+1; i < n; ++i)
+      {
+         //const double Aki = __read_from( A_k[__getIndex(i)], el);
+         double Aki = A_k[i];
+         if ( std::fabs(Aki) > std::fabs(Akp) )
+         {
+            pivk = i;
+            Akp = Aki;
+         }
+      }
+
+      // Test for singular value ...
+      if (Akp == 0.0)
+      {
+         return (k+1);
+         //printf("Singular value %d %d\n", k, el);
+      }
+
+      /* swap a(k,1:N) and a(piv,1:N) if necessary */
+      if ( pivk != k )
+      {
+         ValueType *A_i = A; // pointer to the first column
+         for (int i = 0; i < n; ++i, A_i += (n))
+         {
+            const double Aik = A_i[k   ];
+            const double Aip = A_i[pivk];
+            A_i[k   ] = Aip;
+            A_i[pivk] = Aik;
+         }
+      }
+
+      return pivk;
+   }
+
    int ludec ( const int n, ValueType *RESTRICT A, IndexType *RESTRICT ipiv ) const
    {
       int ierr = ERR_SUCCESS;
@@ -422,55 +522,14 @@ public:
 
       //typedef typename decltype( ipiv[0][0] ) IndexBaseType;
       //typedef int64_t BaseIndexType;
-      alignas(Alignment) BaseIndexType all_pivk[nelems];
+      //alignas(Alignment) BaseIndexType all_pivk[nelems];
 
       /* k-th elimination step number */
       for (int k = 0; k < n; ++k)
       {
         ValueType *A_k = A + (k*n); // pointer to this column
 
-        /* find pivot row number */
-        for (int el = 0; el < nelems; ++el)
-        {
-           int pivk = k;
-           double Akp = A_k[pivk].extract(el);
-           for (int i = k+1; i < n; ++i)
-           {
-              //const double Aki = __read_from( A_k[__getIndex(i)], el);
-              double Aki = A_k[i].extract(el);
-              if ( fabs(Aki) > fabs(Akp) )
-              {
-                 pivk = i;
-                 Akp = Aki;
-              }
-           }
-
-           // Test for singular value ...
-           if (Akp == 0.0)
-           {
-              ierr = (k+1);
-              //printf("Singular value %d %d\n", k, el);
-              break;
-           }
-
-           /* swap a(k,1:N) and a(piv,1:N) if necessary */
-           if ( pivk != k )
-           {
-              ValueType *A_i = A; // pointer to the first column
-              for (int i = 0; i < n; ++i, A_i += (n))
-              {
-                 const double Aik = A_i[k   ].extract(el);
-                 const double Aip = A_i[pivk].extract(el);
-                 A_i[k   ].insert( el, Aip );
-                 A_i[pivk].insert( el, Aik );
-              }
-           }
-
-           all_pivk[el] = pivk;
-
-        } // End scalar section
-
-        ipiv[k].load_a( all_pivk );
+        ipiv[k] = lu_pivot( k, n, A );
 
         /* Scale the elements below the diagonal in
          * column k by 1.0/a(k,k). After the above swap
@@ -510,25 +569,46 @@ public:
       //}
    }
 
+   template <typename _ValueType>
+      typename std::enable_if< SIMD_isScalar<_ValueType>::value, void >::type
+   lu_permute ( const int k, const IndexType& pivk, _ValueType *RESTRICT b) const
+   {
+      if ( pivk != IndexType( k)  )
+      {
+         const double bk = b[k   ];
+         const double bp = b[pivk];
+         b[k   ] = bp;
+         b[pivk] = bk;
+      }
+   }
+
+   // SIMD version.
+   template <typename _ValueType>
+      typename std::enable_if< (SIMD_isScalar<_ValueType>::value == 0), void >::type
+   lu_permute ( const int k, const IndexType& ipiv, _ValueType *RESTRICT b) const
+   {
+      if ( any( ipiv != IndexType( k ) ) )
+      {
+         for (int el = 0; el < vlen; ++el)
+         {
+            const int pivk = ipiv.extract(el);
+            if ( pivk != k )
+            {
+               const double bk = b[k   ].extract( el);
+               const double bp = b[pivk].extract( el);
+               b[k   ].insert( el, bp );
+               b[pivk].insert( el, bk );
+            }
+         }
+      }
+   }
+
    void lusol ( const int n, ValueType *RESTRICT A, IndexType *RESTRICT ipiv, ValueType *RESTRICT b) const
    {
       /* Permute b, based on pivot information in p */
       for (int k = 0; k < n; ++k)
       {
-         if ( any( ipiv[k] != IndexType( k ) ) )
-         {
-            for (int el = 0; el < vlen; ++el)
-            {
-               const int pivk = ipiv[k].extract(el);
-               if ( pivk != k )
-               {
-                  const double bk = b[k   ].extract( el);
-                  const double bp = b[pivk].extract( el);
-                  b[k   ].insert( el, bp );
-                  b[pivk].insert( el, bk );
-               }
-            }
-         }
+         lu_permute (k, ipiv[k], b );
       }
 
       /* Solve Ly = b, store solution y in b */
@@ -576,7 +656,7 @@ public:
          const ValueType ysav = y[j];
          const ValueType ewtj = this->getErrorWeight( j, y);
          //const ValueType dely = fmax( sround * abs(ysav), r0 * ewtj );
-         const ValueType dely = fmax( sround * abs(ysav), r0 / ewtj );
+         const ValueType dely = fmax( sround * fabs(ysav), r0 / ewtj );
          y[j] += dely;
 
          ValueType *jcol = Jy + (j*neq);
@@ -726,7 +806,7 @@ struct SimdERKSolverType : public CommonSolverType<ValueType>
          const ValueType r4 = a1*f1[k] + a3*f3[k] + a4*f4[k] + a5*f5[k];
 
          // Trucation error: difference between 4th and 5th-order RK values.
-         rwk[k] = abs(r5 - r4);
+         rwk[k] = fabs(r5 - r4);
 
          // Update solution.
          y_out[k] = y[k] + r5; // Local extrapolation
@@ -770,7 +850,7 @@ struct SimdERKSolverType : public CommonSolverType<ValueType>
       nst = 0;
       iter = 0;
 
-      MaskType not_done = abs(t - this->t_stop) > ValueType( this->t_round );
+      MaskType not_done = fabs(t - this->t_stop) > ValueType( this->t_round );
 
       while (  any(not_done) )
       {
@@ -779,7 +859,9 @@ struct SimdERKSolverType : public CommonSolverType<ValueType>
          // Take a trial step over h_cur ...
          this->oneStep ( h, y, ytry, rwk, func );
 
-         ValueType herr = max(1.0e-20, this->wnorm ( rwk, y ));
+         const ValueType errmin (1.0e-20);
+         const ValueType err = this->wnorm ( rwk, y );
+         ValueType herr = fmax(/*1.0e-20*/ errmin, err );
 
          // Is there error acceptable?
          MaskType accept = ((herr <= 1.0) | (h <= this->h_min)) & not_done;
@@ -793,14 +875,14 @@ struct SimdERKSolverType : public CommonSolverType<ValueType>
             for (int k = 0; k < this->neq; k++)
                y[k] = select( accept, ytry[k], y[k] );
 
-            not_done = abs(t - this->t_stop) > this->t_round;
+            not_done = fabs(t - this->t_stop) > this->t_round;
          }
 
          ValueType fact = sqrt( sqrt(1.0 / herr) ) * (0.840896415);
 
          // Restrict the rate of change in dt
-         fact = max(fact, 1.0 / this->adaption_limit);
-         fact = min(fact,       this->adaption_limit);
+         fact = fmax(fact, 1.0 / this->adaption_limit);
+         fact = fmin(fact,       this->adaption_limit);
 
 #if defined(VERBOSE) && (VERBOSE > 0)
          if (iter % 10 == 0)
@@ -815,7 +897,7 @@ struct SimdERKSolverType : public CommonSolverType<ValueType>
          h = fmax(h, this->h_min);
 
          // Stretch the final step if we're really close and we didn't just fail ...
-         h = select( accept & ( abs((t + h) - this->t_stop) < this->h_min), this->t_stop - t, h );
+         h = select( accept & ( fabs((t + h) - this->t_stop) < this->h_min), this->t_stop - t, h );
 
          // Don't overshoot the final time ...
          h = select( not_done & ((t + h) > this->t_stop), this->t_stop - t, h );
@@ -1019,7 +1101,7 @@ struct SimdRosSolverType : public CommonSolverType<_ValueType>
       ValueType *RESTRICT yerr = ynew;
       //__global double *ewt  = &Jy[neq*neq];
 
-      MaskType not_done = abs(t - this->t_stop) > ValueType( this->t_round );
+      MaskType not_done = fabs(t - this->t_stop) > ValueType( this->t_round );
       while ( any(not_done) )
       {
          // Compute the RHS and Jacobian matrix.
@@ -1143,7 +1225,7 @@ struct SimdRosSolverType : public CommonSolverType<_ValueType>
             t   = select ( accept, t + h, t   );
             nst = select ( accept, nst+1, nst );
 
-            not_done = abs(t - this->t_stop) > this->t_round;
+            not_done = fabs(t - this->t_stop) > this->t_round;
 
             // Need to actually compute the new solution since it was delayed from above.
             this->dcopy (neq, y, ynew);
@@ -1187,7 +1269,7 @@ struct SimdRosSolverType : public CommonSolverType<_ValueType>
          h = fmax(h, this->h_min);
 
          // Stretch the final step if we're really close and we didn't just fail ...
-         h = select( accept & ( abs((t + h) - this->t_stop) < this->h_min), this->t_stop - t, h );
+         h = select( accept & ( fabs((t + h) - this->t_stop) < this->h_min), this->t_stop - t, h );
 
          // Don't overshoot the final time ...
          h = select( not_done & ((t + h) > this->t_stop), this->t_stop - t, h );
@@ -1459,7 +1541,7 @@ struct SimdSdirkSolverType : public CommonSolverType<_ValueType>
       bool ComputeJ = 1;
       bool ComputeM = 1;
 
-      MaskType not_done = abs(t - this->t_stop) > ValueType( this->t_round );
+      MaskType not_done = fabs(t - this->t_stop) > ValueType( this->t_round );
       while ( any(not_done) )
       {
          //std::cout << "Step: " << iter << nst << " " << ComputeM << " " << ComputeJ << not_done << t << "\n";
@@ -1680,7 +1762,7 @@ struct SimdSdirkSolverType : public CommonSolverType<_ValueType>
                nst = select( Accepted, nst+1, nst );
             }
 
-            not_done = abs(t - this->t_stop) > ValueType( this->t_round );
+            not_done = fabs(t - this->t_stop) > ValueType( this->t_round );
 
             HScalingFactor = select( not_done, 0.9 * pow( 1.0 / herr, (1.0 / this->ELO)), ValueType(1) );
 
@@ -1708,7 +1790,7 @@ struct SimdSdirkSolverType : public CommonSolverType<_ValueType>
          HScalingFactor = fmax( HScalingFactor, 1.0 / this->adaption_limit);
          HScalingFactor = fmin( HScalingFactor,       this->adaption_limit);
 
-         not_done = abs(t - this->t_stop) > ValueType( this->t_round );
+         not_done = fabs(t - this->t_stop) > ValueType( this->t_round );
 
 #if defined(VERBOSE) && (VERBOSE > 0)
          if (iter % VERBOSE == 0)
@@ -1741,7 +1823,7 @@ struct SimdSdirkSolverType : public CommonSolverType<_ValueType>
          ComputeM = any( h != h0 );
          if ( ComputeM )
          {
-            MaskType Stretch_h = Accepted & ( abs((t + h) - this->t_stop) < this->h_min );
+            MaskType Stretch_h = Accepted & ( fabs((t + h) - this->t_stop) < this->h_min );
             h = select( Stretch_h, this->t_stop - t, h );
          }
 
@@ -1783,7 +1865,8 @@ void simd_rk_driver ( const int numProblems, const double *u_in, const double t_
    typedef typename SIMD_MaskSelector<SimdType>::mask_type MaskType;
    const int VectorLength = SIMD_Length<SimdType>::length;
 
-   printf("Instruction Set= %d %s %d %s\n", INSTRSET, typeid(SimdType).name(), VectorLength, typeid( MaskType).name());
+   //printf("Instruction Set= %d %s %d %s\n", INSTRSET, typeid(SimdType).name(), VectorLength, typeid( MaskType).name());
+   printf("SimdType= %s %d %s\n", typeid(SimdType).name(), VectorLength, typeid( MaskType).name());
 
    VectorType<double,Alignment> scalar_out( neq * numProblems );
    VectorType<double,Alignment> vector_out( neq * numProblems );
@@ -1858,6 +1941,8 @@ void simd_rk_driver ( const int numProblems, const double *u_in, const double t_
    //SimdERKSolverType<SimdType> simd_solver( neq );
    typedef SimdERKSolverType<SimdType> SimdSolverType;
    SimdSolverType simd_solver( neq );
+
+   nst = 0, nit = 0, nfe = 0;
 
    for (int i0 = 0; i0 < numProblems; i0 += VectorLength)
    {
@@ -1970,7 +2055,7 @@ void simd_ros_driver ( const int numProblems, const double *u_in, const double t
    typedef typename SIMD_MaskSelector<SimdType>::mask_type MaskType;
    const int VectorLength = SIMD_Length<SimdType>::length;
 
-   printf("Instruction Set= %d %s %d %s\n", INSTRSET, typeid(SimdType).name(), VectorLength, typeid( MaskType).name());
+   printf("SimdType= %s %d %s\n", typeid(SimdType).name(), VectorLength, typeid( MaskType).name());
 
    VectorType<double,Alignment> scalar_out( neq * numProblems );
    VectorType<double,Alignment> vector_out( neq * numProblems );
@@ -2090,12 +2175,16 @@ void simd_ros_driver ( const int numProblems, const double *u_in, const double t
          }
 
          nit += counters.nit * VectorLength;
-         for (int i = 0; i < VectorLength; ++i)
-         {
-            nst += counters.nst[i];
-            nfe += counters.nfe[i];
-            nje += counters.nje[i];
-         }
+
+         nst += sum( counters.nst );
+         nfe += sum( counters.nfe );
+         nje += sum( counters.nje );
+         //for (int i = 0; i < VectorLength; ++i)
+         //{
+         //   nst += counters.nst[i];
+         //   nfe += counters.nfe[i];
+         //   nje += counters.nje[i];
+         //}
 
          std::cout << i0 << ": final " << counters.nst
                          << " " << counters.nit
@@ -2184,7 +2273,7 @@ void simd_sdirk_driver ( const int numProblems, const double *u_in, const double
    typedef typename SIMD_MaskSelector<SimdType>::mask_type MaskType;
    const int VectorLength = SIMD_Length<SimdType>::length;
 
-   printf("Instruction Set= %d %s %d %s\n", INSTRSET, typeid(SimdType).name(), VectorLength, typeid( MaskType).name());
+   printf("SimdType = %s %d %s\n", typeid(SimdType).name(), VectorLength, typeid( MaskType).name());
 
    VectorType<double,Alignment> scalar_out( neq * numProblems );
    VectorType<double,Alignment> vector_out( neq * numProblems );
@@ -2308,14 +2397,20 @@ void simd_sdirk_driver ( const int numProblems, const double *u_in, const double
          }
 
          nit += counters.nit * VectorLength;
-         for (int i = 0; i < VectorLength; ++i)
-         {
-            nst += counters.nst[i];
-            nfe += counters.nfe[i];
-            nje += counters.nje[i];
-            nlu += counters.nlu[i];
-            nni += counters.nni[i];
-         }
+
+         nst += sum( counters.nst );
+         nfe += sum( counters.nfe );
+         nje += sum( counters.nje );
+         nlu += sum( counters.nlu );
+         nni += sum( counters.nni );
+         //for (int i = 0; i < VectorLength; ++i)
+         //{
+         //   nst += counters.nst[i];
+         //   nfe += counters.nfe[i];
+         //   nje += counters.nje[i];
+         //   nlu += counters.nlu[i];
+         //   nni += counters.nni[i];
+         //}
 
          std::cout << i0 << ": final " << counters.nst
                          << " " << counters.nit
