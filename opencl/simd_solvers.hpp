@@ -419,7 +419,7 @@ public:
    typename std::enable_if< (SIMD_isScalar<_ValueType>::value == 0), IndexType >::type
       lu_pivot ( const int k, const int n, _ValueType *RESTRICT A ) const
    {
-      enum { nelems = this->vector_length };
+      enum { nelems = vector_length };
 
       alignas(Alignment) BaseIndexType all_pivk[nelems];
 
@@ -1303,11 +1303,11 @@ struct SimdRosSolverType : public CommonSolverType<_ValueType>
 #define Theta_(_i,_j) ( __matrix_index(_i,_j,Theta) )
 #define Alpha_(_i,_j) ( __matrix_index(_i,_j,Alpha) )
 
-template <typename _ValueType >
+template <typename _ValueType, bool _ReplicateSerial = false >
 struct SimdSdirkSolverType : public CommonSolverType<_ValueType>
 {
    enum { _maxStages = 5 };
-   enum { _replicate = 0 };
+   enum { _replicate = (_ReplicateSerial) ? 1 : 0 };
 
    typedef CommonSolverType<_ValueType> Parent;
 
@@ -1759,7 +1759,7 @@ struct SimdSdirkSolverType : public CommonSolverType<_ValueType>
                   if (this->D[j] != 0.0)
                   {
                      // Only update solutions that were accepted.
-                     ValueType ZeroOrDj = select( Accepted, this->D[j], 0.0 );
+                     ValueType ZeroOrDj = select( Accepted, ValueType(this->D[j]), 0.0 );
                      this->daxpy ( neq, ZeroOrDj, z_j, y );
                   }
                }
@@ -2161,7 +2161,7 @@ struct SimdSdirkSolverType : public CommonSolverType<_ValueType>
                   if (this->D[j] != 0.0)
                   {
                      // Only update solutions that were accepted.
-                     ValueType ZeroOrDj = select( AcceptedSolution, this->D[j], 0.0 );
+                     ValueType ZeroOrDj = select( AcceptedSolution, ValueType(this->D[j]), 0.0 );
                      this->daxpy ( neq, ZeroOrDj, z_j, y );
                   }
                }
@@ -2763,7 +2763,7 @@ void simd_sdirk_driver ( const int numProblems, const double *u_in, const double
    printf("Scalar: %f %d %d %d %d %d %d\n", 1000*time_scalar, nst, nit, nfe, nje, nlu, nni);
 
    simd_cklib_functor<SimdType> simd_func( ck, p );
-   typedef SimdSdirkSolverType<SimdType> SimdSolverType;
+   typedef SimdSdirkSolverType<SimdType,1> SimdSolverType;
    SimdSolverType simd_solver( neq );
    //simd_solver.max_iters=100;
 
@@ -2851,7 +2851,7 @@ void simd_sdirk_driver ( const int numProblems, const double *u_in, const double
 
    time_vector = WallClock() - time_vector;
 
-   printf("SIMD: %f %d %d %d %d %d %d\n", 1000*time_vector, nst, nit, nfe, nje, nlu, nni);
+   printf("SIMD: %f %d %d %d %d %d %d %s\n", 1000*time_vector, nst, nit, nfe, nje, nlu, nni, SimdSolverType::_replicate ? "Replicate-Serial" : "Any-All" );
 
    printf("SIMD speed-up: %f %f %.1f\n", 1000.*time_vector, 1000.*time_scalar, time_scalar/time_vector);
 
