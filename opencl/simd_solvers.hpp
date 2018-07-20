@@ -1307,6 +1307,7 @@ template <typename _ValueType >
 struct SimdSdirkSolverType : public CommonSolverType<_ValueType>
 {
    enum { _maxStages = 5 };
+   enum { _replicate = 0 };
 
    typedef CommonSolverType<_ValueType> Parent;
 
@@ -1365,16 +1366,22 @@ struct SimdSdirkSolverType : public CommonSolverType<_ValueType>
       lenrwk += (_neq * this->numStages);// z
       lenrwk +=  _neq;			 // g
 
+      if ( _replicate ) lenrwk += (_neq*_neq); // An extra matrix.
+
       return lenrwk;
    }
 
    size_t get_leniwk(const int _neq) const
    {
-      return (_neq); // ipiv
+      size_t leniwk = (_neq); // ipiv
+      if ( _replicate ) leniwk += (_neq); // copy of ipiv
+      return leniwk;
    }
 
    size_t get_lenrwk(void) const { return this->get_lenrwk(this->neq); }
    size_t get_leniwk(void) const { return this->get_leniwk(this->neq); }
+
+   // SDIRK internal routines ...
 
    // 4th/3rd-order L-stable SDIRK method with 5 stages.
    // -- E. Hairer and G. Wanner, "Solving ordinary differential equations II:
@@ -1473,22 +1480,21 @@ struct SimdSdirkSolverType : public CommonSolverType<_ValueType>
       Alpha_(4,3) = 25.34908987169226073668861694892683;
    }
 
-   // SDIRK internal routines ...
+   #define nst (counters->nst)
+   #define nfe (counters->nfe)
+   #define nje (counters->nje)
+   #define nlu (counters->nlu)
+   #define nni (counters->nni)
+   #define iter (counters->nit)
+   #define h (*hcur)
+   #define t (*tcur)
+
    template <class Functor, typename Counters>
-   int solve ( ValueType *tcur, ValueType *hcur, Counters* counters, ValueType y[], Functor& func)
+   int solve_anyall ( ValueType *tcur, ValueType *hcur, Counters* counters, ValueType y[], Functor& func)
    {
       int ierr = ERR_SUCCESS;
 
       const int neq = this->neq;
-
-      #define nst (counters->nst)
-      #define nfe (counters->nfe)
-      #define nje (counters->nje)
-      #define nlu (counters->nlu)
-      #define nni (counters->nni)
-      #define iter (counters->nit)
-      #define h (*hcur)
-      #define t (*tcur)
 
       const int InterpolateNewton  = 1;	// Start at zero (0) or interpolate a starting guess (1)
       const int MaxNewtonIterations= 8;	// Max number of newton iterations
@@ -1837,15 +1843,420 @@ struct SimdSdirkSolverType : public CommonSolverType<_ValueType>
       }
 
       return ierr;
+   }
 
-      #undef nst
-      #undef nfe
-      #undef nje
-      #undef nlu
-      #undef nni
-      #undef iter
-      #undef h
-      #undef t
+   // SDIRK solver designed to replicate scalar logical behavior.
+   template <class Functor, typename Counters>
+   int solve_replicate ( ValueType *tcur, ValueType *hcur, Counters* counters, ValueType y[], Functor& func)
+   {
+      int ierr = ERR_SUCCESS;
+
+      const int neq = this->neq;
+
+      const int InterpolateNewton  = 1;	// Start at zero (0) or interpolate a starting guess (1)
+      const int MaxNewtonIterations= 8;	// Max number of newton iterations
+      const double NewtonThetaMin  = 0.005; // Minimum convergence rate for the Newton Iteration (0.001)
+      const double NewtonThetaMax  = 0.999; // Maximum residual drop acceptable
+      const double NewtonTolerance = 0.03;  // Convergence criteria
+      const double Qmax = 1.2;		// Max h-adaption to recycle M
+      const double Qmin = 1.;		// Min ""
+
+      ValueType *rwk = m_rwk.getPointer();
+      IndexType *iwk = m_iwk.getPointer();
+
+      // Estimate the initial step size ...
+      {
+         auto mask = (*hcur < this->h_min);
+         if ( any(mask) )
+         {
+            ValueType h0 = *hcur;
+            //std::cout << "Before hin: " << h0 << ", " << mask << "\n";
+            ierr = this->hin ( *tcur, &h0, y, rwk, func );
+            if (ierr != ERR_SUCCESS)
+            {
+               fprintf(stderr,"Failure solve(): %d %s\n", ierr, GetErrorString(ierr));
+               return ierr;
+            }
+            //std::cout << "After hin: " << h0 << "\n";
+
+            *hcur = select( mask, h0, *hcur );
+         }
+         //printf("hin = %s %s %e %e\n", toString(*hcur).c_str(), toString(mask).c_str(), this->h_min, this->h_max);
+      }
+
+      // Zero the counters ...
+      nst = 0;
+      nfe = 0;
+      nlu = 0;
+      nje = 0;
+      nni = 0;
+      iter = 0;
+
+      // Set the work arrays ...
+      ValueType *RESTRICT fy   = rwk;
+      ValueType *RESTRICT del  = fy + (neq);
+      ValueType *RESTRICT Jy   = del + (neq);
+      ValueType *RESTRICT M    = Jy + (neq*neq);
+      ValueType *RESTRICT z    = M + (neq*neq);
+      ValueType *RESTRICT g    = z + (neq*this->numStages);
+      ValueType *RESTRICT Mtmp = g + neq;
+      ValueType *RESTRICT yerr = del;
+
+      IndexType *RESTRICT ipiv = iwk;
+      IndexType *RESTRICT ipivtmp = ipiv + (neq);
+
+      MaskType ComputeJ (true);
+      MaskType ComputeM (true);
+
+      MaskType not_done = fabs(t - this->t_stop) > ValueType( this->t_round );
+
+      while ( any(not_done) )
+      {
+         //std::cout << "Step: " << iter << nst << " " << ComputeM << " " << ComputeJ << not_done << t << "\n";
+
+         const bool any_ComputeJ = any( ComputeJ );
+         const bool all_ComputeJ = all( ComputeJ );
+         const bool any_ComputeM = any( ComputeM );
+         const bool all_ComputeM = all( ComputeM );
+
+         // Construct the Iteration matrix ... if needed.
+         if ( any(ComputeM) or any_ComputeJ )
+         {
+            // Compute the Jacobian matrix or recycle an old one.
+            if ( any_ComputeJ )
+            {
+               //if (jac)
+               //   jac (neq, t, y, Jy, user_data);
+               //else
+               {
+                  // Compute the RHS ... the fd algorithm expects it.
+                  func (neq, t, y, fy);
+
+                  // Can skip the matrix copy if all need the Jac.
+                  this->fdjac ( t, h, y, fy, (all_ComputeJ) ? Jy : Mtmp , func );
+
+                  nfe = select( not_done & ComputeJ, nfe + (neq+1), nfe );
+               }
+
+               nje = select( not_done & ComputeJ, nje+1, nje );
+
+               // Masked copy.
+               if ( not( all_ComputeJ ) )
+                  for (int i = 0; i < (neq*neq); ++i)
+                     Jy[i] = select( ComputeJ, Mtmp[i], Jy[i] );
+            }
+
+            if ( any_ComputeM )
+            {
+               ValueType *_M = ( all_ComputeM ) ? M : Mtmp;
+               IndexType *_ipiv = ( all_ComputeM ) ? ipiv : ipivtmp;
+
+               // Compute M := 1/(gamma*h) - J
+               const ValueType one_hgamma = 1.0 / (h * this->gamma);
+
+               for (int j = 0; j < neq; ++j)
+               {
+                  ValueType *RESTRICT Mcol = &_M[(j*neq)];
+                  ValueType *RESTRICT Jcol = &Jy[(j*neq)];
+                  for (int i = 0; i < neq; ++i)
+                     Mcol[(i)] = -Jcol[(i)];
+
+                  Mcol[(j)] += one_hgamma;
+               }
+
+               // Factorization M
+               this->ludec( neq, _M, _ipiv );
+
+               nlu = select( not_done & ComputeM, nlu+1, nlu);
+
+               if ( not( all_ComputeM ) )
+               {
+                  for (int i = 0; i < (neq*neq); ++i)
+                     M[i] = select( ComputeM, Mtmp[i], M[i] );
+
+                  for (int i = 0; i < neq; ++i)
+                     ipiv[i] = select( ComputeM, ipivtmp[i], ipiv[i] );
+               }
+            }
+         }
+
+         typedef IndexType StatusType;
+         const BaseIndexType Status_Active   = 0,
+                             Status_Failed   = (1<<1),
+                             Status_Inactive = (1<<2),
+                             Status_Converged= (1<<3);
+
+         MaskType isDone = not(not_done);
+         StatusType Stage_Status = select( isDone, StatusType(Status_Inactive), StatusType(Status_Active) );
+
+         MaskType  Accepted = false; // All are intialized inside of stage loop.
+         ValueType HScalingFactor = select( isDone, ValueType(1.0), ValueType(0.8) );
+         ValueType NewtonTheta = NewtonThetaMin;
+
+         for (int s = 0; s < this->numStages && any(Stage_Status == Status_Active); s++)
+         {
+            //std::cout << "stage " << s << " " << Stage_Status << "\n";
+
+            // Initial the RK stage vectors Z_i and G.
+            ValueType *z_s = &z[(s*neq)];
+            this->dzero (neq, z_s);
+            this->dzero (neq, g);
+
+            // Compute the function at this stage ...
+            if (s)
+            {
+               for (int j = 0; j < s; ++j)
+               {
+                  // G = \Sum_j Theta_i,j*Z_j = h * \Sum_j A_i,j*F(Z_j)
+                  ValueType *z_j = &z[(j*neq)];
+                  this->daxpy1 (neq, Theta_(s,j), z_j, g);
+
+                  // Z_i = \Sum_j Alpha(i,j)*Z_j
+                  if (InterpolateNewton)
+                     this->daxpy1 (neq, Alpha_(s,j), z_j, z_s);
+               }
+            }
+
+            // Solve the non-linear problem with the Newton-Raphson method.
+            StatusType Newton_Status = select( Stage_Status == Status_Active,
+                                               StatusType( Status_Active),
+                                               StatusType( Status_Inactive) );
+            Accepted = false;
+            HScalingFactor = select( Stage_Status == Status_Active, 0.8, HScalingFactor );
+            NewtonTheta = select( Stage_Status == Status_Active, NewtonThetaMin, NewtonTheta );
+            ValueType NewtonResidual;
+
+            for (int NewtonIter = 0;
+                     NewtonIter < MaxNewtonIterations && any(Newton_Status == Status_Active);
+                     ++NewtonIter)
+            {
+               nni = select( (Newton_Status == Status_Active), nni+1, nni );
+
+               // 1) Build the RHS of the root equation: F := G + (h*gamma)*f(y+Z_s) - Z_s
+               for (int k = 0; k < neq; ++k)
+                  del[(k)] = y[(k)] + z_s[(k)];
+
+               func (neq, t, del, fy);
+               nfe = select( (Newton_Status == Status_Active), nfe+1, nfe );
+
+               const ValueType hgamma = h * this->gamma;
+               for (int k = 0; k < neq; ++k)
+                  del[(k)] = g[(k)] + hgamma * fy[(k)] - z_s[(k)];
+                //del[(k)] = g[(k)] - z_s[(k)] + hgamma * fy[(k)];
+
+               // 2) Solve the linear problem: M*delz = (1/hgamma)F ... so scale F first.
+               this->dscal (neq, 1.0/hgamma, del);
+               this->lusol (neq, M, ipiv, del);
+
+               // 3) Check the convergence and convergence rate
+               // 3.1) Compute the norm of the correction.
+               const ValueType dnorm = this->wnorm ( del, y);
+
+               //std::cout << "miter: " << iter <<" " << s << " "<< NewtonIter << dnorm << NewtonResidual << Newton_Status << "\n";
+
+               // 3.2) If not the first iteration, estimate the rate.
+               if (NewtonIter != 0)
+               {
+                  NewtonTheta = dnorm / NewtonResidual; // How much as the residual changed from last iteration.
+
+                  MaskType Diverging  = (NewtonTheta >= NewtonThetaMax);
+                           Diverging &= (Newton_Status == Status_Active);
+
+                  ValueType ConvergenceRate = NewtonTheta / (1.0 - NewtonTheta); // Possible FLTEXP here.
+
+                  Newton_Status = select( Diverging, StatusType(Status_Failed), Newton_Status );
+
+                  //std::cout << " " << ConvergenceRate << Diverging << NewtonTheta << Newton_Status << "\n";
+
+                  // If one is diverging, may just give up early all around.
+                  // Use the status flag to change or hold h.
+                  if ( all( Newton_Status != Status_Active ) )
+                  {
+                     //std::cout << "all inactive @ (NewtonTheta >= NewtonThetaMax)\n";
+                     break;
+                  }
+
+                  // So, not everyone is diverging. Test if any are converging too slowly.
+                  // We'll shrink h and restart, too.
+                  // Predict the error after Max iterations with the current rate:
+                  // ... res * Theta^(ItersLeft/(1-Theta))
+                  ValueType PredictedError = dnorm * pow( NewtonTheta,
+                                       (MaxNewtonIterations-NewtonIter)/(1.0-NewtonTheta));
+
+                  MaskType PredictedErrorTooLarge  = ( PredictedError > NewtonTolerance );
+                           PredictedErrorTooLarge &= ( Newton_Status == Status_Active );
+
+                  if ( any( PredictedErrorTooLarge ) )
+                  {
+                     //std::cout << "PredictedErrorTooLarge " << PredictedErrorTooLarge << "\n";
+
+                     // Doubtful we'll converge, shrink h and try again.
+                     ValueType QNewton = fmin(10.0, PredictedError / NewtonTolerance);
+                     ValueType PredictedHScalingFactor =
+                                  0.9 * pow( QNewton, -1.0 / (1.0 + MaxNewtonIterations - NewtonIter));
+
+                     HScalingFactor = select( PredictedErrorTooLarge, PredictedHScalingFactor, HScalingFactor );
+                     Newton_Status = select( PredictedErrorTooLarge, StatusType(Status_Failed), Newton_Status );
+
+                     // Don't let a finished lane hold up an exit.
+                     if ( all( Newton_Status != Status_Active ) )
+                     {
+                        //std::cout << "all inactive @ PredictedErrorTooLarge\n";
+                        break;
+                     }
+                  }
+
+                  // So, at least someone is making progress. Test for new convergence.
+                  MaskType isConverged =   ( ConvergenceRate * dnorm < NewtonTolerance )
+                                         & MaskType( Newton_Status == Status_Active );
+
+                  Accepted |= isConverged;
+                  //std::cout << "isConverged: " << isConverged << Newton_Status << "\n";
+               }
+
+               // Save the residual norm for the next iteration unless I'm already converged.
+               MaskType UpdateSolution =  ( Newton_Status == Status_Active );
+               NewtonResidual = select( UpdateSolution, dnorm, NewtonResidual );
+
+               // 4) Update the solution if newly accepted: Z_s <- Z_s + delta
+               ValueType OneOrZero = select( UpdateSolution, ValueType(1), ValueType(0) );
+               this->daxpy (neq, OneOrZero, del, z_s);
+
+               Newton_Status = select( Accepted, StatusType( Status_Inactive ), Newton_Status );
+            }
+
+            Stage_Status = select( Newton_Status == Status_Failed,
+                                   StatusType( Status_Failed ), Stage_Status );
+            //std::cout << "Accepted: " << Accepted << " " << Stage_Status << Newton_Status << "\n";
+
+            //ComputeJ = select( Accepted, ComputeJ, MaskType(false) ); // Jacobian is still valid if not Accepted.
+            //ComputeM = select( Accepted, ComputeM, MaskType(true ) ); // M is invalid since h will change (perhaps) drastically.
+            ComputeJ =     false; // Jacobian is still valid if not Accepted.
+            ComputeM =  Accepted; // M is invalid since h will change (perhaps) drastically.
+
+         } // ... stages
+
+         if ( any( Accepted ) )
+         {
+            // Compute the error estimation of the trial solution.
+            this->dzero (neq, yerr);
+            for (int j = 0; j < this->numStages; ++j)
+            {
+               ValueType *z_j = &z[(j*neq)];
+               if (this->E[j] != 0.0)
+                  this->daxpy1 (neq, this->E[j], z_j, yerr);
+            }
+
+            ValueType herr = fmax(1.0e-20, this->wnorm ( yerr, y));
+
+            // Is the error acceptable?
+            MaskType AcceptedSolution = Accepted && (((herr <= 1.0) || (h <= this->h_min)) && not_done);
+            if ( any( AcceptedSolution ) )
+            {
+               // If stiffly-accurate, Z_s with s := numStages, is the solution.
+               // Else, sum the stage solutions: y_n+1 <- y_n + \Sum_j D_j * Z_j
+               for (int j = 0; j < this->numStages; ++j)
+               {
+                  ValueType *z_j = &z[(j*neq)];
+                  if (this->D[j] != 0.0)
+                  {
+                     // Only update solutions that were accepted.
+                     ValueType ZeroOrDj = select( AcceptedSolution, this->D[j], 0.0 );
+                     this->daxpy ( neq, ZeroOrDj, z_j, y );
+                  }
+               }
+
+               t = select( AcceptedSolution, t + h, t );
+               nst = select( AcceptedSolution, nst+1, nst );
+            }
+
+            not_done = fabs(t - this->t_stop) > ValueType( this->t_round );
+
+            HScalingFactor = select( Accepted, 0.9 * pow( 1.0 / herr, (1.0 / this->ELO)),
+                                                       /*failed*/ HScalingFactor );
+            HScalingFactor = select( not_done, HScalingFactor, /*hold fixed*/ ValueType(1) );
+
+            // Reuse the Jacobian if the Newton Solver is converging fast enough.
+            // ... no need to recompute if I've failed since nothing has changed.
+            ComputeJ = Accepted & ( NewtonTheta > NewtonThetaMin ) & not_done;
+
+            // Don't refine if it's not a big step and we could reuse the M matrix.
+            MaskType recycle_M = not ( ComputeJ )
+                                 and ( HScalingFactor >= Qmin && HScalingFactor <= Qmax )
+                                 and ( Accepted );
+
+            //std::cout << "Recycle M: " << recycle_M << "\n";
+            ComputeM       = not( recycle_M );
+            HScalingFactor = select( recycle_M, ValueType(1), HScalingFactor );
+         }
+
+         // Restrict the rate of change in dt
+         HScalingFactor = fmax( HScalingFactor, 1.0 / this->adaption_limit);
+         HScalingFactor = fmin( HScalingFactor,       this->adaption_limit);
+
+         not_done = fabs(t - this->t_stop) > ValueType( this->t_round );
+
+#if defined(VERBOSE) && (VERBOSE > 0)
+         if (iter % VERBOSE == 0)
+         {
+            std::cout << "iter= " << iter;
+            std::cout << " accept= " << Accepted;
+            std::cout << " not_done= " << not_done;
+            std::cout << " t= " << t;
+            std::cout << " h= " << h;
+            std::cout << " fact= " << HScalingFactor;
+            std::cout << " T= " << y[getTempIndex(neq)] << "\n";
+         }
+#endif
+
+         ValueType h0 = h;
+
+         // Apply grow/shrink factor for next step.
+         h *= HScalingFactor;
+
+         // Limit based on the upper/lower bounds
+         h = fmin(h, this->h_max);
+         h = fmax(h, this->h_min);
+
+         // Stretch the final step if we're really close
+         // ... and we didn't just fail
+         MaskType Stretch_h = Accepted & ( fabs((t + h) - this->t_stop) < this->h_min );
+         h = select( Stretch_h, this->t_stop - t, h );
+
+         // Don't overshoot the final time ...
+         h = select( not_done & ((t + h) > this->t_stop), this->t_stop - t, h );
+
+         ComputeM = ( h != h0 );
+
+         ++iter;
+         if ( this->max_iters && iter > this->max_iters )
+         {
+            ierr = ERR_TOO_MUCH_WORK;
+            //printf("(iter > max_iters)\n");
+            break;
+         }
+      }
+
+      return ierr;
+   }
+
+   #undef nst
+   #undef nfe
+   #undef nje
+   #undef nlu
+   #undef nni
+   #undef iter
+   #undef h
+   #undef t
+
+   // SDIRK solver designed to replicate scalar logical behavior.
+   template <class Functor, typename Counters>
+   int solve ( ValueType *tcur, ValueType *hcur, Counters* counters, ValueType y[], Functor& func)
+   {
+      if ( _replicate )
+         return this->solve_replicate ( tcur, hcur, counters, y, func );
+      else
+         return this->solve_anyall ( tcur, hcur, counters, y, func );
    }
 
 };
@@ -2133,7 +2544,6 @@ void simd_ros_driver ( const int numProblems, const double *u_in, const double t
    simd_cklib_functor<SimdType> simd_func( ck, p );
    typedef SimdRosSolverType<SimdType> SimdSolverType;
    SimdSolverType simd_solver( neq );
-   //simd_solver.max_iters=200;
 
    nst = nit = nfe = nje = 0;
 
@@ -2332,7 +2742,7 @@ void simd_sdirk_driver ( const int numProblems, const double *u_in, const double
       for (int k = 0; k < neq; ++k)
          out[i*neq + k] = u[k];
 
-      if (i % VectorLength == 0)
+      //if (i % VectorLength == 0)
          printf("%d: final %d %d %d %d %d %e %e %f %f\n", i, _nst, _nit, _nfe, _nlu, _nni, u[ getTempIndex(neq) ], T0, (u[ getTempIndex(neq) ]-T0)/T0, 1000*(t_end-t_begin));
    };
 
@@ -2355,7 +2765,7 @@ void simd_sdirk_driver ( const int numProblems, const double *u_in, const double
    simd_cklib_functor<SimdType> simd_func( ck, p );
    typedef SimdSdirkSolverType<SimdType> SimdSolverType;
    SimdSolverType simd_solver( neq );
-   simd_solver.max_iters=1000;
+   //simd_solver.max_iters=100;
 
    nst = nit = nfe = nlu = nje = nni = 0;
 
