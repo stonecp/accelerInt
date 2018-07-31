@@ -1507,26 +1507,6 @@ struct SimdSdirkSolverType : public CommonSolverType<_ValueType>
       ValueType *rwk = m_rwk.getPointer();
       IndexType *iwk = m_iwk.getPointer();
 
-      // Estimate the initial step size ...
-      {
-         auto mask = (*hcur < this->h_min);
-         if ( any(mask) )
-         {
-            ValueType h0 = *hcur;
-            //std::cout << "Before hin: " << h0 << ", " << mask << "\n";
-            ierr = this->hin ( *tcur, &h0, y, rwk, func );
-            if (ierr != ERR_SUCCESS)
-            {
-               fprintf(stderr,"Failure solve(): %d %s\n", ierr, GetErrorString(ierr));
-               return ierr;
-            }
-            //std::cout << "After hin: " << h0 << "\n";
-
-            *hcur = select( mask, h0, *hcur );
-         }
-         //printf("hin = %s %s %e %e\n", toString(*hcur).c_str(), toString(mask).c_str(), this->h_min, this->h_max);
-      }
-
       // Zero the counters ...
       nst = 0;
       nfe = 0;
@@ -1863,26 +1843,6 @@ struct SimdSdirkSolverType : public CommonSolverType<_ValueType>
 
       ValueType *rwk = m_rwk.getPointer();
       IndexType *iwk = m_iwk.getPointer();
-
-      // Estimate the initial step size ...
-      {
-         auto mask = (*hcur < this->h_min);
-         if ( any(mask) )
-         {
-            ValueType h0 = *hcur;
-            //std::cout << "Before hin: " << h0 << ", " << mask << "\n";
-            ierr = this->hin ( *tcur, &h0, y, rwk, func );
-            if (ierr != ERR_SUCCESS)
-            {
-               fprintf(stderr,"Failure solve(): %d %s\n", ierr, GetErrorString(ierr));
-               return ierr;
-            }
-            //std::cout << "After hin: " << h0 << "\n";
-
-            *hcur = select( mask, h0, *hcur );
-         }
-         //printf("hin = %s %s %e %e\n", toString(*hcur).c_str(), toString(mask).c_str(), this->h_min, this->h_max);
-      }
 
       // Zero the counters ...
       nst = 0;
@@ -2253,6 +2213,28 @@ struct SimdSdirkSolverType : public CommonSolverType<_ValueType>
    template <class Functor, typename Counters>
    int solve ( ValueType *tcur, ValueType *hcur, Counters* counters, ValueType y[], Functor& func)
    {
+      // Estimate the initial step size ...
+      {
+         auto mask = (*hcur < this->h_min);
+         if ( any(mask) )
+         {
+            ValueType *rwk = m_rwk.getPointer();
+
+            ValueType h0 = *hcur;
+            //std::cout << "Before hin: " << h0 << ", " << mask << "\n";
+            int ierr = this->hin ( *tcur, &h0, y, rwk, func );
+            if (ierr != ERR_SUCCESS)
+            {
+               fprintf(stderr,"Failure solve(): %d %s\n", ierr, GetErrorString(ierr));
+               return ierr;
+            }
+            //std::cout << "After hin: " << h0 << "\n";
+
+            *hcur = select( mask, h0, *hcur );
+         }
+         //printf("hin = %s %s %e %e\n", toString(*hcur).c_str(), toString(mask).c_str(), this->h_min, this->h_max);
+      }
+
       if ( _replicate )
          return this->solve_replicate ( tcur, hcur, counters, y, func );
       else
@@ -2763,7 +2745,7 @@ void simd_sdirk_driver ( const int numProblems, const double *u_in, const double
    printf("Scalar: %f %d %d %d %d %d %d\n", 1000*time_scalar, nst, nit, nfe, nje, nlu, nni);
 
    simd_cklib_functor<SimdType> simd_func( ck, p );
-   typedef SimdSdirkSolverType<SimdType,1> SimdSolverType;
+   typedef SimdSdirkSolverType<SimdType,0> SimdSolverType;
    SimdSolverType simd_solver( neq );
    //simd_solver.max_iters=100;
 
