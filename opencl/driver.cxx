@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 #include <tuple>
+#include <algorithm>
 
 #include <fstream>
 #include <sstream>
@@ -236,6 +237,7 @@ int main (int argc, char* argv[])
    SolverTags solverTag = None;
    double t_stop = 0.001;
    char *load_from_file = NULL;
+   bool randomize_input = false;
 
    for (int index = 1; index < argc; ++index)
    {
@@ -282,6 +284,10 @@ int main (int argc, char* argv[])
       else if (strcmp(argv[index], "-cv") == 0)
       {
          solverTag = CV;
+      }
+      else if (strcmp(argv[index], "-rand") == 0)
+      {
+         randomize_input = true;
       }
    }
 
@@ -407,6 +413,31 @@ int main (int argc, char* argv[])
 
       printf("numProblems (in) = %d %d\n", numProblems, np);
 
+      std::vector< int   > order(np);
+
+      for (int i = 0; i < np; ++i)
+         order[i] = i;
+
+      if ( randomize_input )
+      {
+         std::cout << "Randomizing input order\n";
+
+         std::vector< float > f(np);
+
+         auto comp = [&](const int &a, const int &b)
+            {
+               return f[ a ] < f[ b ] ;
+            };
+
+         for (int i = 0; i < np; ++i)
+            f[i] = float( rand() ) / RAND_MAX;
+
+         std::sort( order.begin(), order.end(), comp );
+
+         //for (int i = 0; i < np; ++i)
+         //   printf("%d %d %f\n", i, order[i], f[order[i]]);
+      }
+
       //if (np < numProblems)
       //   numProblems = np;
 
@@ -416,15 +447,17 @@ int main (int argc, char* argv[])
 
       for (int i = 0; i < std::min(np, numProblems); ++i)
       {
+         const int line_index = order[i];
+
          double x_, v_ = 0, T_, p_;
          std::vector<double> yk_(ck.n_species);
 
-         x_ = strtod( file_data[i+1][0].c_str(), NULL );
-         T_ = strtod( file_data[i+1][1].c_str(), NULL );
-         p_ = strtod( file_data[i+1][2].c_str(), NULL );
+         x_ = strtod( file_data[line_index+1][0].c_str(), NULL );
+         T_ = strtod( file_data[line_index+1][1].c_str(), NULL );
+         p_ = strtod( file_data[line_index+1][2].c_str(), NULL );
 
          for (int k = 0; k < ck.n_species; ++k)
-            yk_[k] = strtod( file_data[i+1][k+3].c_str(), NULL );
+            yk_[k] = strtod( file_data[line_index+1][k+3].c_str(), NULL );
 
          const int offset = i * neq;
          u_in[ offset + getTempIndex(neq) ] = T_;
