@@ -876,7 +876,7 @@ __inline void ckratc_ (const double T,
 
          // Concentration of the third-body ... could be a specific species, too.
          double cthb;
-         if (ck->rx_falloff_spidx[n] != -1)
+         if (ck->rx_falloff_spidx[n] == -1)
          {
             cthb = ctb[__getIndex(rxn_idx)];
             ctb[__getIndex(rxn_idx)] = 1.0;

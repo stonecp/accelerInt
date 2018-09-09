@@ -323,7 +323,7 @@ inline void ckratc (const ValueType& T,
 
          // Concentration of the third-body ... could be a specific species, too.
          ValueType cthb;
-         if (ck->rx_falloff_spidx[n] != -1)
+         if (ck->rx_falloff_spidx[n] == -1)
          {
             cthb = ctb[rxn_idx];
             ctb[rxn_idx] = 1.0;
