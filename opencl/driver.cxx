@@ -159,6 +159,79 @@ static int jac_func (const int neq, const double time, double y[], double fy[], 
    return ck->jac( neq, time, y, fy );
 }
 
+#ifdef USE_TCHEM
+#warning 'Enabling TChem'
+namespace TChem
+{
+
+extern "C"
+{
+# include <TC_interface.h>
+# include <TC_defs.h>
+}
+
+struct Functor
+{
+   Functor( const double constant_p = 1.013250e6 )
+   {
+      std::string cheminp = "chem.inp";
+      std::string thermdat = "therm.dat";
+      TC_initChem (const_cast<char*>(cheminp.c_str()), const_cast<char*>(thermdat.c_str()), 0, 0.2);
+
+      /* Internal TChem variables */
+      TC_abstol = 1.0e-9;
+      TC_reltol = 1.0e-11;
+
+      TC_setThermoPres (constant_p/10.);
+
+      printf("TChem initialized with pressure= %f %d %d\n", constant_p, TC_getNspec(), TC_getNreac());
+   }
+
+   void rhs (const int neq, const double t, double *y, double *fy)
+   {
+#if ( getTempIndex(0) == 0 )
+# warning 'Using TC_getSrc directly'
+      TC_getSrc ( y, neq, fy );
+#else
+      std::vector<double> ytmp(neq), fytmp(neq);
+
+      const int nsp = neq-1;
+
+      ytmp[0] = y[nsp];
+      for (int i = 0; i < nsp; ++i)
+      {
+         ytmp[i+1] = y[i];
+      }
+
+      TC_getSrc ( &ytmp[0], neq, &fytmp[0] );
+
+      fy[nsp] = fytmp[0];
+      for (int i = 0; i < nsp; ++i)
+         fy[i] = fytmp[i+1];
+#endif
+   }
+   int rhs (const int neq, const double t, double *y, double *fy, void *vdata)
+   {
+      this->rhs (neq, t, y, fy);
+      return 0;
+   }
+
+   int operator() (const int neq, const double t, double *y, double *fy)
+   {
+      this->rhs (neq, t, y, fy);
+      return 0;
+   }
+
+   int jac (const int &neq, double t, double y[], double fy[])
+   {
+      runtime_assert(true);
+   }
+
+};
+
+} // namespace TChem
+#endif
+
 #ifdef USE_SUNDIALS
 # include <cv_integrator.h>
 
@@ -238,6 +311,7 @@ int main (int argc, char* argv[])
    double t_stop = 0.001;
    char *load_from_file = NULL;
    bool randomize_input = false;
+   bool enableTChem = false;
 
    for (int index = 1; index < argc; ++index)
    {
@@ -268,6 +342,10 @@ int main (int argc, char* argv[])
          index++;
          runtime_assert( index < argc );
          load_from_file = argv[index];
+      }
+      else if (strcmp(argv[index], "-tchem") == 0)
+      {
+         enableTChem = true;
       }
       else if (strcmp(argv[index], "-ros") == 0)
       {
@@ -543,6 +621,27 @@ int main (int argc, char* argv[])
    CV::Integrator< cklib_functor > cv_obj( neq );
 #endif
 
+#ifdef USE_TCHEM
+   CV::Integrator< TChem::Functor > cv_tchem( neq );
+   TChem::Functor tchem_func;
+   if (enableTChem)
+   {
+      VectorType<double> tc_out(neq), ck_out(neq);
+
+      cklib_func( neq, 0.0, &u_in[0], ck_out.getPointer());
+      printf("cklib_func\n");
+      tchem_func( neq, 0.0, &u_in[0], tc_out.getPointer());
+      for (int i = 0; i < neq; ++i)
+         printf("[%d]: %e %e %e\n", i, tc_out[i], ck_out[i], std::fabs(tc_out[i]-ck_out[i]));
+   }
+#else
+   if (enableTChem)
+   {
+      fprintf(stderr,"TChem requested but not available. Recompile with TChem enabled\n");
+      return 2;
+   }
+#endif
+
    VectorType<double> _rwk;
    VectorType<int> _iwk;
 
@@ -566,7 +665,13 @@ int main (int argc, char* argv[])
       if (solverTag == CV)
       {
 #ifdef USE_SUNDIALS
-         auto _ret = cv_driver (neq, u.getPointer(), t_stop, cv_obj, cklib_func );
+         auto _ret = 
+#ifdef USE_TCHEM
+            ( enableTChem ) ?
+               cv_driver (neq, u.getPointer(), t_stop, cv_tchem, tchem_func ) :
+#endif
+               cv_driver (neq, u.getPointer(), t_stop, cv_obj, cklib_func );
+
          _nst += std::get<0>(_ret);
          _nfe += std::get<1>(_ret);
          _nje += std::get<2>(_ret);

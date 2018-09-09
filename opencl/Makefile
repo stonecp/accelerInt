@@ -112,7 +112,7 @@ ifneq ($(CV),0)
    LDFLAGS+= -lsundials_cvodes -lsundials_nvecserial -L${SUNDIALS_ROOT}/lib
 endif
 ifneq ($(USE_TCHEM),0)
-   CFLAGS += -I$(TCHEM_ROOT)/include -D__ENABLE_TCHEM=1
+   CFLAGS += -I$(TCHEM_ROOT)/include -D__ENABLE_TCHEM=1 -DUSE_TCHEM
    LDFLAGS += -ltchem -L$(TCHEM_ROOT)/lib
 endif
 
