@@ -1,5 +1,6 @@
 SUNDIALS_ROOT=$(HOME)/kaust/sundials/2.5.0
 TCHEM_ROOT=$(HOME)/kaust/tchem/TChem_v1.0
+PYJAC_ROOT=
 #SUNDIALS_ROOT=$(HOME)/sundials/
 
 #CLINCPATH= $(AMDAPPSDKROOT)/include
@@ -14,6 +15,10 @@ ifneq ($(tchem),)
 ifneq ($(tchem),0)
    USE_TCHEM = 1
 endif
+endif
+
+ifneq ($(pyjac),)
+   PYJAC_ROOT=$(pyjac)
 endif
 
 CV= 0
@@ -95,11 +100,9 @@ LDFLAGS = -lstdc++
 #LDFLAGS+= -mkl=sequential
 #endif
 
-ifneq ($(pyjac),)
- ifneq ($(pyjac),0)
-   CFLAGS += -D__ENABLE_PYJAC -I$(PYJACPATH)
-   LDFLAGS += -L$(PYJACPATH) -lc_pyjac
- endif
+ifneq ($(PYJAC_ROOT),)
+  CFLAGS += -DUSE_PYJAC -I$(PYJAC_ROOT)
+  LDFLAGS += -L$(PYJAC_ROOT) -lpyjac
 endif
 
 ifneq ($(CL),0)

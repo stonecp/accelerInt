@@ -232,6 +232,77 @@ struct Functor
 } // namespace TChem
 #endif
 
+#ifdef USE_PYJAC
+#warning 'Enabling pyJac'
+namespace PyJac
+{
+
+extern "C"
+{
+# include <chem_utils.h>
+# include <dydt.h>
+# include <header.h>
+# include <jacob.h>
+# include <mass_mole.h>
+# include <mechanism.h>
+# include <rates.h>
+# include <sparse_multiplier.h>
+}
+
+struct Functor
+{
+   double pres;
+
+   Functor( const double constant_p = 1.013250e6 )
+      : pres(constant_p/10.0)
+   {
+      printf("PyJac initialized with pressure= %f %d\n", constant_p, (NSP));
+   }
+
+   void rhs (const int neq, const double t, double *y, double *fy)
+   {
+#if ( getTempIndex(0) == 0 )
+# warning 'Using PyJac directly (ignoring N v. (N-1) form.'
+      dydt ( t, this->pres, y, fy );
+#else
+      std::vector<double> ytmp(neq), fytmp(neq);
+
+      const int nsp = neq-1;
+
+      ytmp[0] = y[nsp];
+      for (int i = 0; i < nsp; ++i)
+      {
+         ytmp[i+1] = y[i];
+      }
+
+      dydt ( t, this->pres, &ytmp[0], &fytmp[0] );
+
+      fy[nsp] = fytmp[0];
+      for (int i = 0; i < nsp; ++i)
+         fy[i] = fytmp[i+1];
+#endif
+   }
+   int rhs (const int neq, const double t, double *y, double *fy, void *vdata)
+   {
+      this->rhs (neq, t, y, fy);
+      return 0;
+   }
+
+   int operator() (const int neq, const double t, double *y, double *fy)
+   {
+      this->rhs (neq, t, y, fy);
+      return 0;
+   }
+
+   int jac (const int &neq, double t, double y[], double fy[])
+   {
+      runtime_assert(true);
+   }
+};
+
+} // namespace PyJac
+#endif
+
 #ifdef USE_SUNDIALS
 # include <cv_integrator.h>
 
@@ -248,7 +319,7 @@ std::tuple<int,int,int,int>
 
    ValueType *u = u_in;
 
-   const int nsteps = (write_data == true) ? 1000 : 1;
+   const int nsteps = (write_data == true) ? 1000 : 20;
    ScalarType t0 = 0.0;
    ScalarType dt = t_stop / double(nsteps);
 
@@ -312,6 +383,7 @@ int main (int argc, char* argv[])
    char *load_from_file = NULL;
    bool randomize_input = false;
    bool enableTChem = false;
+   bool enablePyJac = false;
 
    for (int index = 1; index < argc; ++index)
    {
@@ -346,6 +418,10 @@ int main (int argc, char* argv[])
       else if (strcmp(argv[index], "-tchem") == 0)
       {
          enableTChem = true;
+      }
+      else if (strcmp(argv[index], "-pyjac") == 0)
+      {
+         enablePyJac = true;
       }
       else if (strcmp(argv[index], "-ros") == 0)
       {
@@ -569,7 +645,9 @@ int main (int argc, char* argv[])
       std::vector<double> x(ck.n_species);
       std::vector<double> y(ck.n_species);
 
-      x[iH2] = 2.0; x[iO2] = 1.0; x[iN2] = 4.0;
+      x[iH2] = 2.0;
+      x[iO2] = 1.0;
+      if (iN2 != -1) x[iN2] = 4.0;
 
       const double T = 1000.0; // K
       double x_sum(0);
@@ -582,7 +660,7 @@ int main (int argc, char* argv[])
       // Mole to mass fractions.
       CK::ckxty (&x[0], &y[0], ck);
       const double rho = CK::ckrhoy(p, T, &y[0], ck);
-      printf("cp_mass=%e, cv_mass=%e, h_mass=%e, u_mass=%e, rho=%e, H2=%f, O2=%f, N2=%f, T=%f\n", CK::ckcpbs(T,&y[0],ck), CK::ckcvbs(T,&y[0],ck), CK::ckhbms(T,&y[0],ck), CK::ckubms(T,&y[0],ck), rho, x[iH2], x[iO2], x[iN2], T);
+      printf("cp_mass=%e, cv_mass=%e, h_mass=%e, u_mass=%e, rho=%e, H2=%f, O2=%f, N2=%f, T=%f\n", CK::ckcpbs(T,&y[0],ck), CK::ckcvbs(T,&y[0],ck), CK::ckhbms(T,&y[0],ck), CK::ckubms(T,&y[0],ck), rho, x[iH2], x[iO2], (iN2 != -1) ? x[iN2] : -1.0, T);
 
       numProblems = 1;
       u_in.resize( neq );
@@ -629,15 +707,49 @@ int main (int argc, char* argv[])
       VectorType<double> tc_out(neq), ck_out(neq);
 
       cklib_func( neq, 0.0, &u_in[0], ck_out.getPointer());
-      printf("cklib_func\n");
       tchem_func( neq, 0.0, &u_in[0], tc_out.getPointer());
       for (int i = 0; i < neq; ++i)
-         printf("[%d]: %e %e %e\n", i, tc_out[i], ck_out[i], std::fabs(tc_out[i]-ck_out[i]));
+      {
+         double refval = std::fabs(tc_out[i]);
+         if ( refval <= 1e-20 ) refval = 1.0;
+         printf("[%d]: %e %e %e %e\n", i, tc_out[i], ck_out[i], std::fabs(tc_out[i]-ck_out[i])/refval, refval);
+      }
    }
 #else
    if (enableTChem)
    {
       fprintf(stderr,"TChem requested but not available. Recompile with TChem enabled\n");
+      return 2;
+   }
+#endif
+
+#ifdef USE_PYJAC
+   CV::Integrator< PyJac::Functor > cv_pyjac( neq );
+   PyJac::Functor pyjac_func;
+   if (enablePyJac)
+   {
+      VectorType<double> pj_out(neq), ck_out(neq);
+
+      cklib_func( neq, 0.0, &u_in[0], ck_out.getPointer());
+      pyjac_func( neq, 0.0, &u_in[0], pj_out.getPointer());
+      for (int i = 0; i < neq; ++i)
+      {
+         double refval = std::fabs(pj_out[i]);
+         if ( refval <= 1e-20 ) refval = 1.0;
+         printf("[%d]: %e %e %e %e\n", i, pj_out[i], ck_out[i], std::fabs(pj_out[i]-ck_out[i])/refval, refval);
+      }
+# ifdef USE_TCHEM
+      if (enableTChem)
+      {
+         fprintf(stderr,"Error! Both TChem and PyJac were requested. Deselect one to avoid confusion.\n");
+         return 10;
+      }
+# endif
+   }
+#else
+   if (enablePyJac)
+   {
+      fprintf(stderr,"PyJac requested but not available. Recompile with PyJac enabled\n");
       return 2;
    }
 #endif
@@ -669,6 +781,10 @@ int main (int argc, char* argv[])
 #ifdef USE_TCHEM
             ( enableTChem ) ?
                cv_driver (neq, u.getPointer(), t_stop, cv_tchem, tchem_func ) :
+#endif
+#ifdef USE_PYJAC
+            ( enablePyJac ) ?
+               cv_driver (neq, u.getPointer(), t_stop, cv_pyjac, pyjac_func ) :
 #endif
                cv_driver (neq, u.getPointer(), t_stop, cv_obj, cklib_func );
 
